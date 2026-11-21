@@ -1,4 +1,4 @@
-name = "esaad-rewards-app"
+name = 'fzx'
 main = "worker.ts"
 compatibility_date = "2025-02-14"
 
