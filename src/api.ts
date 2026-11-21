@@ -39,6 +39,13 @@ export interface ActiveSessionInfo {
   meta?: VisitorMeta;
 }
 
+export interface AdminPreferences {
+  starredIds: string[];
+  archivedIds: string[];
+  flaggedIds: string[];
+  soundEnabled: boolean;
+}
+
 export interface ServerStatsPayload {
   onlineCount: number;
   totalVisitorsCount: number;
@@ -46,6 +53,7 @@ export interface ServerStatsPayload {
   userPages: Record<string, string>;
   userMeta: Record<string, VisitorMeta>;
   activeSessions: ActiveSessionInfo[];
+  preferences?: AdminPreferences;
   serverTime?: number;
 }
 
@@ -416,4 +424,62 @@ export async function adminLogoutApi() {
     headers,
     credentials: 'same-origin'
   });
+}
+
+export async function getAdminPreferences(): Promise<AdminPreferences> {
+  const headers: Record<string, string> = {};
+  if (activeAdminToken) {
+    headers.Authorization = `Bearer ${activeAdminToken}`;
+  }
+  const res = await fetch('/api/admin/preferences', {
+    headers,
+    credentials: 'same-origin'
+  });
+  if (!res.ok) {
+    return {
+      starredIds: [],
+      archivedIds: [],
+      flaggedIds: [],
+      soundEnabled: true
+    };
+  }
+  return res.json();
+}
+
+export async function updateAdminPreferences(patch: Partial<AdminPreferences>): Promise<AdminPreferences> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (activeAdminToken) {
+    headers.Authorization = `Bearer ${activeAdminToken}`;
+  }
+  const res = await fetch('/api/admin/preferences', {
+    method: 'PATCH',
+    headers,
+    credentials: 'same-origin',
+    body: JSON.stringify(patch)
+  });
+  if (!res.ok) {
+    throw new Error('Failed to update preferences');
+  }
+  return res.json();
+}
+
+export async function toggleAdminPreference(
+  toggle: 'starredIds' | 'archivedIds' | 'flaggedIds',
+  id: string,
+  value?: boolean
+): Promise<AdminPreferences> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (activeAdminToken) {
+    headers.Authorization = `Bearer ${activeAdminToken}`;
+  }
+  const res = await fetch('/api/admin/preferences', {
+    method: 'PATCH',
+    headers,
+    credentials: 'same-origin',
+    body: JSON.stringify({ toggle, id, ...(typeof value === 'boolean' ? { value } : {}) })
+  });
+  if (!res.ok) {
+    throw new Error('Failed to toggle preference');
+  }
+  return res.json();
 }

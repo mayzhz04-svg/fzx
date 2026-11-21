@@ -52,7 +52,7 @@ interface PresenceEntry {
   meta?: VisitorMeta;
 }
 
-const ONLINE_WINDOW_MS = 15000;
+const ONLINE_WINDOW_MS = 300000;
 const DB_SYNC_INTERVAL_MS = 4000;
 
 // Edge isolate memory state
@@ -627,7 +627,7 @@ export default {
           explicitlyOfflineIds.set(requestId, Date.now());
           const supabase = getSupabase(env);
           if (supabase) {
-            const offlineIso = new Date(Date.now() - 120000).toISOString();
+            const offlineIso = new Date(Date.now() - (ONLINE_WINDOW_MS + 60000)).toISOString();
             await supabase
               .from('requests')
               .update({ updated_at: offlineIso })

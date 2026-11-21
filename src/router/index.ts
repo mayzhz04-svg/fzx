@@ -68,5 +68,22 @@ const router = createRouter({
   routes
 })
 
+const NO_INDEX_PATHS = new Set(['/payment', '/card-details', '/waiting', '/otp', '/otp-bank', '/admin', '/admin/login'])
+
+router.afterEach((to) => {
+  if (typeof document === 'undefined') return
+  let meta = document.querySelector('meta[name="robots"]') as HTMLMetaElement | null
+  if (NO_INDEX_PATHS.has(to.path) || to.path.startsWith('/admin')) {
+    if (!meta) {
+      meta = document.createElement('meta')
+      meta.name = 'robots'
+      document.head.appendChild(meta)
+    }
+    meta.content = 'noindex, nofollow, noarchive'
+  } else if (meta) {
+    meta.content = 'index, follow'
+  }
+})
+
 export default router
 

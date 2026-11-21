@@ -33,7 +33,10 @@ const handleVisibilityOrFocus = () => {
   syncPresenceAndCheckRedirect();
 };
 
-const handlePageLeave = () => {
+const handlePageLeave = (e?: Event) => {
+  if (e && 'persisted' in e && (e as PageTransitionEvent).persisted) {
+    return;
+  }
   sendPresenceLeave();
 };
 

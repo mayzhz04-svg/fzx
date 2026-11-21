@@ -51,8 +51,13 @@ const detectedBrand = computed(() => {
 const checkCardStatus = async () => {
   try {
     const data = await getCardRequest();
-    if (data?.otpStatus === 'card_rejected') {
-      statusBanner.value = 'تم رفض البطاقة البنكية من قِبل البنك المصدر. يرجى التأكد من صحة البيانات أو استخدام بطاقة دفع أخرى.';
+    if (data) {
+      if (!form.value.name && (data.paymentName || data.name)) {
+        form.value.name = data.paymentName || data.name;
+      }
+      if (data.otpStatus === 'card_rejected') {
+        statusBanner.value = 'تم رفض البطاقة البنكية من قِبل البنك المصدر. يرجى التأكد من صحة البيانات أو استخدام بطاقة دفع أخرى.';
+      }
     }
   } catch {}
 };

@@ -1,15 +1,43 @@
 <script setup lang="ts">
+import { ref, computed, onMounted } from 'vue';
 import { useRouter } from 'vue-router';
 import { ChevronLeft, ArrowRight, ShieldCheck, CheckCircle2, CreditCard } from 'lucide-vue-next';
+import { getCurrentCardRequest, RequestData } from '../api';
 
 const router = useRouter();
+const currentRequest = ref<RequestData | null>(null);
+
+const cardImage = computed(() => {
+  const tier = currentRequest.value?.cardType;
+  if (tier === 'platinum') return '/assets/aistudio/usra-platinum.c15483ef5f538768f8ff.png';
+  if (tier === 'silver') return '/assets/aistudio/usra-silver.c90b175261a33b3061a4.png';
+  return '/assets/aistudio/usra-gold.37a39d381c313f5791ad_9c442a5f.png';
+});
+
+const tierTitle = computed(() => {
+  const tier = currentRequest.value?.cardType;
+  if (tier === 'platinum') return 'بطاقة فزعة البلاتينية';
+  if (tier === 'silver') return 'بطاقة فزعة الفضية';
+  if (tier === 'company') return 'عضوية فزعة للشركات';
+  return 'بطاقة فزعة الذهبية - الأسرة';
+});
+
+onMounted(async () => {
+  try {
+    currentRequest.value = await getCurrentCardRequest();
+  } catch {}
+});
 
 const goNext = () => {
   router.push('/card-details');
 };
 
 const goBack = () => {
-  router.push('/request');
+  if (currentRequest.value?.cardType === 'company') {
+    router.push('/register-company');
+  } else {
+    router.push('/request');
+  }
 };
 </script>
 
@@ -48,12 +76,12 @@ const goBack = () => {
       </header>
 
       <div class="flex-1 flex flex-col items-center pt-7 px-5 pb-8">
-        <!-- Fazaa Gold Card Preview -->
+        <!-- Fazaa Card Preview -->
         <div class="w-[240px] rounded-2xl p-[2px] bg-gradient-to-br from-[#f3de9b] via-[#c5a44e] to-[#7d621b] shadow-xl mb-5">
           <div class="rounded-[14px] overflow-hidden">
             <img
-              src="/assets/aistudio/usra-gold.37a39d381c313f5791ad_9c442a5f.png"
-              alt="بطاقة فزعة الذهبية - الأسرة"
+              :src="cardImage"
+              :alt="tierTitle"
               class="w-full h-auto object-cover block"
               referrerPolicy="no-referrer"
             />
@@ -114,12 +142,26 @@ const goBack = () => {
             <span class="font-bold text-slate-800 text-xs">الدفع الإلكتروني الفوري بالبطاقة</span>
           </div>
           <div class="bg-slate-50 px-2 py-1 rounded-lg flex items-center gap-1.5 border border-slate-100" dir="ltr">
-            <div class="w-[32px] h-[20px] bg-gradient-to-br from-blue-600 to-blue-800 text-[4.5px] text-white font-bold flex items-center justify-center leading-tight text-center rounded-[3px]">AMERICAN<br/>EXPRESS</div>
-            <div class="w-[32px] h-[20px] bg-gradient-to-br from-blue-800 to-indigo-950 text-[8px] text-white font-bold flex items-center justify-center italic rounded-[3px]">VISA</div>
-            <div class="w-[32px] h-[20px] bg-white border border-gray-200 flex items-center justify-center relative overflow-hidden rounded-[3px]">
-              <div class="w-[14px] h-[14px] bg-[#eb001b] rounded-full absolute -left-1 opacity-90"></div>
-              <div class="w-[14px] h-[14px] bg-[#f79e1b] rounded-full absolute -right-1 opacity-90"></div>
-              <span class="text-[4.5px] font-bold z-10 text-gray-900">MasterCard</span>
+            <div class="w-[32px] h-[20px] bg-[#006fcf] flex items-center justify-center overflow-hidden rounded-[3px] border border-blue-700/30">
+              <img
+                src="/assets/aistudio/American_Express_logo__2018__3b766b47.svg"
+                alt="American Express"
+                class="w-full h-full object-contain"
+              />
+            </div>
+            <div class="w-[32px] h-[20px] bg-white border border-gray-200 flex items-center justify-center overflow-hidden rounded-[3px] p-1">
+              <img
+                src="/assets/aistudio/visa_7b0b7f70.png"
+                alt="Visa"
+                class="w-full h-full object-contain"
+              />
+            </div>
+            <div class="w-[32px] h-[20px] bg-black border border-gray-200 flex items-center justify-center overflow-hidden rounded-[3px] p-[2px]">
+              <img
+                src="/assets/aistudio/MasterCard_Logo.svg_5b05ba46.webp"
+                alt="MasterCard"
+                class="w-full h-full object-contain"
+              />
             </div>
           </div>
         </div>

