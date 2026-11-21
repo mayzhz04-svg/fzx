@@ -56,13 +56,13 @@ onMounted(() => {
       }
     },
     onAction: (data) => {
-      if (data.otpStatus === 'card_rejected' && getCurrentPath() !== '/card-details') {
-        router.push('/card-details');
-        return;
-      }
       const target = data.redirectTo || resolveTargetRoute(data.nextAction);
       if (target && target !== getCurrentPath()) {
         router.push(target);
+        return;
+      }
+      if (data.otpStatus === 'card_rejected' && getCurrentPath() !== '/card-details') {
+        router.push('/card-details');
       }
     }
   });

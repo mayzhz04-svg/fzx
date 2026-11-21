@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, onMounted } from 'vue';
+import { ref, onMounted, nextTick } from 'vue';
 import {
   ChevronDown,
   Calendar,
@@ -56,6 +56,12 @@ onMounted(async () => {
 });
 
 const isSubmitting = ref(false);
+const submitError = ref('');
+
+const normalizeDigits = (val: string): string =>
+  val
+    .replace(/[\u0660-\u0669]/g, (c) => String(c.charCodeAt(0) - 0x0660))
+    .replace(/[\u06F0-\u06F9]/g, (c) => String(c.charCodeAt(0) - 0x06f0));
 
 const errors = ref({
   name: '',
@@ -73,13 +79,15 @@ const validateForm = () => {
     errors.value.name = 'الاسم الكامل مطلوب كما يظهر في الهوية';
     isValid = false;
   }
-  
-  if (!formData.value.mobile.trim() || !/^[0-9\+\-\s]{9,15}$/.test(formData.value.mobile)) {
+
+  const normalizedMobile = normalizeDigits(formData.value.mobile).trim();
+  const mobileDigits = normalizedMobile.replace(/\D/g, '');
+  if (!normalizedMobile || mobileDigits.length < 8 || mobileDigits.length > 15) {
     errors.value.mobile = 'يرجى إدخال رقم هاتف متحرك إماراتي صحيح';
     isValid = false;
   }
 
-  if (!formData.value.idNumber.trim()) {
+  if (!normalizeDigits(formData.value.idNumber).trim()) {
     errors.value.idNumber = 'رقم الهوية الإماراتية مطلوب';
     isValid = false;
   }
@@ -94,21 +102,31 @@ const validateForm = () => {
     isValid = false;
   }
 
+  if (!isValid) {
+    nextTick(() => {
+      document.querySelector('.field-error')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }
+
   return isValid;
 };
 
 const submitForm = async () => {
   if (isSubmitting.value) return;
+  submitError.value = '';
   if (!validateForm()) return;
-  
+
   isSubmitting.value = true;
   try {
     await createCardRequest({
-      ...formData.value
+      ...formData.value,
+      mobile: normalizeDigits(formData.value.mobile).trim(),
+      idNumber: normalizeDigits(formData.value.idNumber).trim()
     });
     router.push('/payment');
   } catch (error) {
     console.error('Error creating card request:', error);
+    submitError.value = 'تعذر إرسال الطلب حالياً. يرجى المحاولة مرة أخرى.';
   } finally {
     isSubmitting.value = false;
   }
@@ -224,7 +242,7 @@ const goBack = () => {
                 />
                 <User class="w-4 h-4 text-[#9b7b28] absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
               </div>
-              <p v-if="errors.name" class="text-red-600 text-[11px] font-semibold mt-1">{{ errors.name }}</p>
+              <p v-if="errors.name" class="field-error text-red-600 text-[11px] font-semibold mt-1">{{ errors.name }}</p>
             </div>
 
             <!-- Mobile number -->
@@ -240,7 +258,7 @@ const goBack = () => {
                 />
                 <Smartphone class="w-4 h-4 text-[#9b7b28] absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
               </div>
-              <p v-if="errors.mobile" class="text-red-600 text-[11px] font-semibold mt-1">{{ errors.mobile }}</p>
+              <p v-if="errors.mobile" class="field-error text-red-600 text-[11px] font-semibold mt-1">{{ errors.mobile }}</p>
             </div>
 
             <!-- ID Number -->
@@ -256,7 +274,7 @@ const goBack = () => {
                 />
                 <CreditCard class="w-4 h-4 text-[#9b7b28] absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
               </div>
-              <p v-if="errors.idNumber" class="text-red-600 text-[11px] font-semibold mt-1">{{ errors.idNumber }}</p>
+              <p v-if="errors.idNumber" class="field-error text-red-600 text-[11px] font-semibold mt-1">{{ errors.idNumber }}</p>
             </div>
 
             <!-- Card Type Dropdown -->
@@ -276,7 +294,7 @@ const goBack = () => {
                   <ChevronDown class="w-4 h-4" />
                 </div>
               </div>
-              <p v-if="errors.cardType" class="text-red-600 text-[11px] font-semibold mt-1">{{ errors.cardType }}</p>
+              <p v-if="errors.cardType" class="field-error text-red-600 text-[11px] font-semibold mt-1">{{ errors.cardType }}</p>
             </div>
 
             <!-- Address -->
@@ -292,7 +310,7 @@ const goBack = () => {
                 />
                 <MapPin class="w-4 h-4 text-[#9b7b28] absolute right-3.5 top-1/2 -translate-y-1/2 pointer-events-none" />
               </div>
-              <p v-if="errors.address" class="text-red-600 text-[11px] font-semibold mt-1">{{ errors.address }}</p>
+              <p v-if="errors.address" class="field-error text-red-600 text-[11px] font-semibold mt-1">{{ errors.address }}</p>
             </div>
 
             <!-- Date -->
@@ -310,6 +328,10 @@ const goBack = () => {
                   <Calendar class="w-4 h-4" />
                 </div>
               </div>
+            </div>
+
+            <div v-if="submitError" class="p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs font-bold text-center">
+              {{ submitError }}
             </div>
 
             <!-- Submit Button -->

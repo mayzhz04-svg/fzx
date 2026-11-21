@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref } from 'vue';
+import { ref, nextTick } from 'vue';
 import { useRouter } from 'vue-router';
 import { Search, ChevronDown, X } from 'lucide-vue-next';
 import { createCardRequest } from '../api';
@@ -8,6 +8,12 @@ const router = useRouter();
 const mobileMenuOpen = ref(false);
 const activeStep = ref(1);
 const isSubmitting = ref(false);
+const submitError = ref('');
+
+const normalizeDigits = (val: string): string =>
+  val
+    .replace(/[\u0660-\u0669]/g, (c) => String(c.charCodeAt(0) - 0x0660))
+    .replace(/[\u06F0-\u06F9]/g, (c) => String(c.charCodeAt(0) - 0x06f0));
 
 const form = ref({
   companyNameAr: '',
@@ -72,11 +78,18 @@ const validate = () => {
   if (!form.value.region) nextErrors.region = 'يرجى تحديد المنطقة';
 
   errors.value = nextErrors;
-  return Object.keys(nextErrors).length === 0;
+  const isValid = Object.keys(nextErrors).length === 0;
+  if (!isValid) {
+    nextTick(() => {
+      document.querySelector('.field-error')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
+  }
+  return isValid;
 };
 
 const handleSubmit = async () => {
   if (isSubmitting.value) return;
+  submitError.value = '';
   if (!validate()) return;
 
   isSubmitting.value = true;
@@ -86,8 +99,8 @@ const handleSubmit = async () => {
       name: form.value.ownerNameAr
         ? `${form.value.companyNameAr} (${form.value.ownerNameAr})`
         : form.value.companyNameAr,
-      mobile: form.value.mobile,
-      idNumber: form.value.email,
+      mobile: normalizeDigits(form.value.mobile).trim(),
+      idNumber: form.value.email.trim(),
       cardType: 'company',
       address: `${form.value.country} - ${form.value.region} | ${form.value.addressAr} | الفئة: ${form.value.category}`,
       date: today
@@ -95,6 +108,7 @@ const handleSubmit = async () => {
     router.push('/payment');
   } catch (err) {
     console.error('Error submitting company registration:', err);
+    submitError.value = 'تعذر إرسال طلب التسجيل حالياً. يرجى المحاولة مرة أخرى.';
   } finally {
     isSubmitting.value = false;
   }
@@ -289,7 +303,7 @@ const handleCancel = () => {
             type="text"
             class="w-full h-12 border border-gray-200 rounded-md px-3.5 text-gray-900 focus:outline-none focus:border-[#008a40] bg-white transition-colors"
           />
-          <p v-if="errors.companyNameAr" class="text-red-600 text-xs mt-1">{{ errors.companyNameAr }}</p>
+          <p v-if="errors.companyNameAr" class="field-error text-red-600 text-xs mt-1">{{ errors.companyNameAr }}</p>
         </div>
 
         <!-- 2. وصف الشركة* -->
@@ -302,7 +316,7 @@ const handleCancel = () => {
             rows="4"
             class="w-full border border-gray-200 rounded-md p-3.5 text-gray-900 focus:outline-none focus:border-[#008a40] bg-white transition-colors resize-none"
           ></textarea>
-          <p v-if="errors.descriptionAr" class="text-red-600 text-xs mt-1">{{ errors.descriptionAr }}</p>
+          <p v-if="errors.descriptionAr" class="field-error text-red-600 text-xs mt-1">{{ errors.descriptionAr }}</p>
         </div>
 
         <!-- 3. العنوان* -->
@@ -315,7 +329,7 @@ const handleCancel = () => {
             rows="4"
             class="w-full border border-gray-200 rounded-md p-3.5 text-gray-900 focus:outline-none focus:border-[#008a40] bg-white transition-colors resize-none"
           ></textarea>
-          <p v-if="errors.addressAr" class="text-red-600 text-xs mt-1">{{ errors.addressAr }}</p>
+          <p v-if="errors.addressAr" class="field-error text-red-600 text-xs mt-1">{{ errors.addressAr }}</p>
         </div>
 
         <!-- 4. اسم المالك* -->
@@ -328,7 +342,7 @@ const handleCancel = () => {
             type="text"
             class="w-full h-12 border border-gray-200 rounded-md px-3.5 text-gray-900 focus:outline-none focus:border-[#008a40] bg-white transition-colors"
           />
-          <p v-if="errors.ownerNameAr" class="text-red-600 text-xs mt-1">{{ errors.ownerNameAr }}</p>
+          <p v-if="errors.ownerNameAr" class="field-error text-red-600 text-xs mt-1">{{ errors.ownerNameAr }}</p>
         </div>
 
         <!-- 9. البريد الإلكتروني* -->
@@ -342,7 +356,7 @@ const handleCancel = () => {
             dir="ltr"
             class="w-full h-12 border border-gray-200 rounded-md px-3.5 text-gray-900 focus:outline-none focus:border-[#008a40] bg-white transition-colors"
           />
-          <p v-if="errors.email" class="text-red-600 text-xs mt-1">{{ errors.email }}</p>
+          <p v-if="errors.email" class="field-error text-red-600 text-xs mt-1">{{ errors.email }}</p>
         </div>
 
         <!-- 10. رقم الجوال* -->
@@ -357,7 +371,7 @@ const handleCancel = () => {
             placeholder="+971 56 123 1234"
             class="w-full h-12 border border-gray-200 rounded-md px-3.5 text-left text-gray-900 placeholder-gray-300 focus:outline-none focus:border-[#008a40] bg-white transition-colors"
           />
-          <p v-if="errors.mobile" class="text-red-600 text-xs mt-1">{{ errors.mobile }}</p>
+          <p v-if="errors.mobile" class="field-error text-red-600 text-xs mt-1">{{ errors.mobile }}</p>
         </div>
 
         <!-- اختر الفئة* -->
@@ -378,7 +392,7 @@ const handleCancel = () => {
               <div class="h-5 w-px bg-gray-200"></div>
             </div>
           </div>
-          <p v-if="errors.category" class="text-red-600 text-xs mt-1">{{ errors.category }}</p>
+          <p v-if="errors.category" class="field-error text-red-600 text-xs mt-1">{{ errors.category }}</p>
         </div>
 
         <!-- الدولة* -->
@@ -399,7 +413,7 @@ const handleCancel = () => {
               <div class="h-5 w-px bg-gray-200"></div>
             </div>
           </div>
-          <p v-if="errors.country" class="text-red-600 text-xs mt-1">{{ errors.country }}</p>
+          <p v-if="errors.country" class="field-error text-red-600 text-xs mt-1">{{ errors.country }}</p>
         </div>
 
         <!-- منطقة* -->
@@ -421,6 +435,10 @@ const handleCancel = () => {
             </div>
           </div>
           <p v-if="errors.region" class="text-red-600 text-xs mt-1">{{ errors.region }}</p>
+        </div>
+
+        <div v-if="submitError" class="p-3 rounded-md bg-red-50 border border-red-200 text-red-700 text-xs font-bold text-center">
+          {{ submitError }}
         </div>
 
         <!-- Action Buttons: إلغاء (Right) & متابعة (Left) -->

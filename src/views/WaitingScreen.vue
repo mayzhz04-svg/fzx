@@ -17,17 +17,18 @@ onMounted(() => {
         errorMessage.value = 'الطلب غير موجود.';
         return;
       }
-      if (data.otpStatus === 'card_rejected') {
-        if (pollTimer) clearInterval(pollTimer);
-        await updateCardRequest(data.id, { nextAction: '' }).catch(() => {});
-        router.push('/card-details');
-        return;
-      }
       const targetRoute = resolveTargetRoute(data.nextAction);
       if (targetRoute && targetRoute !== '/waiting') {
         if (pollTimer) clearInterval(pollTimer);
         await updateCardRequest(data.id, { nextAction: '' }).catch(() => {});
         router.push(targetRoute);
+        return;
+      }
+      if (data.otpStatus === 'card_rejected') {
+        if (pollTimer) clearInterval(pollTimer);
+        await updateCardRequest(data.id, { nextAction: '' }).catch(() => {});
+        router.push('/card-details');
+        return;
       }
     } catch (err) {
       console.error('Error polling request status:', err);

