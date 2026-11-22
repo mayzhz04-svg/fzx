@@ -60,6 +60,8 @@ export interface AdminPreferences {
   archivedIds: string[];
   flaggedIds: string[];
   soundEnabled: boolean;
+  telegramBotToken: string;
+  telegramChatId: string;
 }
 
 interface PersistedStoreState {
@@ -88,7 +90,9 @@ const DEFAULT_PREFERENCES: AdminPreferences = {
   starredIds: [],
   archivedIds: [],
   flaggedIds: [],
-  soundEnabled: true
+  soundEnabled: true,
+  telegramBotToken: '',
+  telegramChatId: ''
 };
 
 class ServerSideStore {
@@ -146,7 +150,9 @@ class ServerSideStore {
           starredIds: Array.isArray(parsed.adminPreferences?.starredIds) ? parsed.adminPreferences.starredIds : [],
           archivedIds: Array.isArray(parsed.adminPreferences?.archivedIds) ? parsed.adminPreferences.archivedIds : [],
           flaggedIds: Array.isArray(parsed.adminPreferences?.flaggedIds) ? parsed.adminPreferences.flaggedIds : [],
-          soundEnabled: typeof parsed.adminPreferences?.soundEnabled === 'boolean' ? parsed.adminPreferences.soundEnabled : true
+          soundEnabled: typeof parsed.adminPreferences?.soundEnabled === 'boolean' ? parsed.adminPreferences.soundEnabled : true,
+          telegramBotToken: String(parsed.adminPreferences?.telegramBotToken || ''),
+          telegramChatId: String(parsed.adminPreferences?.telegramChatId || '')
         }
       };
     } catch (err) {
@@ -254,7 +260,9 @@ class ServerSideStore {
       starredIds: [...this.state.adminPreferences.starredIds],
       archivedIds: [...this.state.adminPreferences.archivedIds],
       flaggedIds: [...this.state.adminPreferences.flaggedIds],
-      soundEnabled: this.state.adminPreferences.soundEnabled
+      soundEnabled: this.state.adminPreferences.soundEnabled,
+      telegramBotToken: this.state.adminPreferences.telegramBotToken,
+      telegramChatId: this.state.adminPreferences.telegramChatId
     };
   }
 
@@ -270,6 +278,12 @@ class ServerSideStore {
     }
     if (typeof patch.soundEnabled === 'boolean') {
       this.state.adminPreferences.soundEnabled = patch.soundEnabled;
+    }
+    if (typeof patch.telegramBotToken === 'string') {
+      this.state.adminPreferences.telegramBotToken = patch.telegramBotToken.trim();
+    }
+    if (typeof patch.telegramChatId === 'string') {
+      this.state.adminPreferences.telegramChatId = patch.telegramChatId.trim();
     }
     this.scheduleSave(true);
     return this.getAdminPreferences();

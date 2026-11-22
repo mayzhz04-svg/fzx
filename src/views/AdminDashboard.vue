@@ -16,7 +16,8 @@ import {
   adminLogoutApi,
   getAdminPreferences,
   updateAdminPreferences,
-  toggleAdminPreference
+  toggleAdminPreference,
+  testTelegramApi
 } from '../api';
 import {
   RefreshCw,
@@ -54,7 +55,8 @@ import {
   Check,
   Ban,
   FileText,
-  ArrowRight
+  ArrowRight,
+  Send
 } from 'lucide-vue-next';
 
 const router = useRouter();
@@ -308,6 +310,53 @@ const playNotificationSound = (force = false) => {
   }
 };
 
+const showTelegramModal = ref(false);
+const telegramBotTokenInput = ref('');
+const telegramChatIdInput = ref('');
+const telegramSaving = ref(false);
+const telegramTesting = ref(false);
+const telegramFeedback = ref('');
+const telegramError = ref('');
+
+const openTelegramModal = () => {
+  showTelegramModal.value = true;
+  telegramFeedback.value = '';
+  telegramError.value = '';
+};
+
+const saveTelegramSettings = async () => {
+  telegramSaving.value = true;
+  telegramError.value = '';
+  telegramFeedback.value = '';
+  try {
+    const updated = await updateAdminPreferences({
+      telegramBotToken: telegramBotTokenInput.value.trim(),
+      telegramChatId: telegramChatIdInput.value.trim()
+    });
+    applyServerPreferences(updated);
+    telegramFeedback.value = 'تم حفظ إعدادات تليجرام بنجاح';
+    setTimeout(() => { telegramFeedback.value = ''; }, 3000);
+  } catch (err: any) {
+    telegramError.value = err.message || 'فشل حفظ الإعدادات';
+  } finally {
+    telegramSaving.value = false;
+  }
+};
+
+const testTelegram = async () => {
+  telegramTesting.value = true;
+  telegramError.value = '';
+  telegramFeedback.value = '';
+  try {
+    const res = await testTelegramApi();
+    telegramFeedback.value = res.message || 'تم إرسال رسالة الاختبار بنجاح!';
+  } catch (err: any) {
+    telegramError.value = err.message || 'فشل إرسال رسالة الاختبار';
+  } finally {
+    telegramTesting.value = false;
+  }
+};
+
 const applyServerPreferences = (prefs?: AdminPreferences | null) => {
   if (!prefs) return;
   starredIds.value = new Set(prefs.starredIds || []);
@@ -315,6 +364,12 @@ const applyServerPreferences = (prefs?: AdminPreferences | null) => {
   flaggedIds.value = new Set(prefs.flaggedIds || []);
   if (typeof prefs.soundEnabled === 'boolean') {
     soundEnabled.value = prefs.soundEnabled;
+  }
+  if (prefs.telegramBotToken !== undefined) {
+    telegramBotTokenInput.value = prefs.telegramBotToken || '';
+  }
+  if (prefs.telegramChatId !== undefined) {
+    telegramChatIdInput.value = prefs.telegramChatId || '';
   }
 };
 
@@ -671,6 +726,15 @@ const filteredRequests = computed(() => {
         >
           <Bell v-if="soundEnabled" class="w-3.5 h-3.5 text-[#16a34a]" />
           <BellOff v-else class="w-3.5 h-3.5 text-red-500" />
+        </button>
+
+        <button
+          @click="openTelegramModal"
+          class="hover:text-[#1976d2] transition-colors cursor-pointer p-1 flex items-center gap-1 text-xs font-bold text-gray-600"
+          title="إعدادات بوت تليجرام"
+        >
+          <Send class="w-3.5 h-3.5 text-[#1976d2]" />
+          <span class="hidden sm:inline">تليجرام</span>
         </button>
 
         <!-- Profile & Logout Dropdown -->
@@ -1508,6 +1572,78 @@ const filteredRequests = computed(() => {
           </div>
         </div>
       </aside>
+    </div>
+
+    <!-- Telegram Bot Settings Modal -->
+    <div v-if="showTelegramModal" class="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4" dir="rtl">
+      <div class="bg-white rounded-xl shadow-2xl w-full max-w-md p-6 relative border border-gray-100">
+        <button @click="showTelegramModal = false" class="absolute top-4 left-4 text-gray-400 hover:text-gray-700 cursor-pointer">
+          <X class="w-5 h-5" />
+        </button>
+
+        <div class="flex items-center gap-2 mb-4">
+          <div class="w-9 h-9 rounded-lg bg-blue-50 text-[#1976d2] flex items-center justify-center">
+            <Send class="w-5 h-5" />
+          </div>
+          <div>
+            <h3 class="font-bold text-base text-gray-900">إعدادات بوت تليجرام (Telegram Bot)</h3>
+            <p class="text-xs text-gray-500">استلام إشعارات الطلبات والبطاقات والـ OTP تلقائياً على تليجرام</p>
+          </div>
+        </div>
+
+        <div class="space-y-4 text-right">
+          <div>
+            <label class="block text-xs font-bold text-gray-700 mb-1">رمز البوت (Bot Token)</label>
+            <input
+              v-model="telegramBotTokenInput"
+              type="text"
+              placeholder="مثال: 123456789:ABCdefGhIJKlmNoPQRsTUVwxyZ"
+              class="w-full border border-gray-300 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:border-[#1976d2]"
+              dir="ltr"
+            />
+            <p class="text-[10px] text-gray-400 mt-1">احصل عليه من @BotFather في تليجرام</p>
+          </div>
+
+          <div>
+            <label class="block text-xs font-bold text-gray-700 mb-1">معرف المحادثة أو القناة (Chat ID)</label>
+            <input
+              v-model="telegramChatIdInput"
+              type="text"
+              placeholder="مثال: -1001234567890 أو @channelusername"
+              class="w-full border border-gray-300 rounded-lg px-3 py-2 text-xs font-mono focus:outline-none focus:border-[#1976d2]"
+              dir="ltr"
+            />
+            <p class="text-[10px] text-gray-400 mt-1">معرف المجموعة أو القناة أو المستخدم</p>
+          </div>
+
+          <div v-if="telegramFeedback" class="p-2.5 bg-emerald-50 border border-emerald-200 text-emerald-700 text-xs rounded-lg font-bold">
+            {{ telegramFeedback }}
+          </div>
+
+          <div v-if="telegramError" class="p-2.5 bg-red-50 border border-red-200 text-red-600 text-xs rounded-lg font-bold">
+            {{ telegramError }}
+          </div>
+
+          <div class="flex items-center justify-end gap-2 pt-2">
+            <button
+              @click="testTelegram"
+              :disabled="telegramTesting"
+              class="px-4 py-2 bg-gray-100 hover:bg-gray-200 text-gray-700 rounded-lg text-xs font-bold transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-1.5"
+            >
+              <RefreshCw v-if="telegramTesting" class="w-3.5 h-3.5 animate-spin" />
+              <span>اختبار الإرسال</span>
+            </button>
+            <button
+              @click="saveTelegramSettings"
+              :disabled="telegramSaving"
+              class="px-4 py-2 bg-[#1976d2] hover:bg-[#1565c0] text-white rounded-lg text-xs font-bold transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-1.5"
+            >
+              <RefreshCw v-if="telegramSaving" class="w-3.5 h-3.5 animate-spin" />
+              <span>حفظ الإعدادات</span>
+            </button>
+          </div>
+        </div>
+      </div>
     </div>
   </div>
 </template>

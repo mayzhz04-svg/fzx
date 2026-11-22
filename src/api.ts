@@ -44,6 +44,8 @@ export interface AdminPreferences {
   archivedIds: string[];
   flaggedIds: string[];
   soundEnabled: boolean;
+  telegramBotToken: string;
+  telegramChatId: string;
 }
 
 export interface ServerStatsPayload {
@@ -480,7 +482,9 @@ export async function getAdminPreferences(): Promise<AdminPreferences> {
       starredIds: [],
       archivedIds: [],
       flaggedIds: [],
-      soundEnabled: true
+      soundEnabled: true,
+      telegramBotToken: '',
+      telegramChatId: ''
     };
   }
   return res.json();
@@ -522,4 +526,21 @@ export async function toggleAdminPreference(
     throw new Error('Failed to toggle preference');
   }
   return res.json();
+}
+
+export async function testTelegramApi(): Promise<{ ok: boolean; message: string }> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (activeAdminToken) {
+    headers.Authorization = `Bearer ${activeAdminToken}`;
+  }
+  const res = await fetch('/api/admin/telegram/test', {
+    method: 'POST',
+    headers,
+    credentials: 'same-origin'
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(data.error || 'فشل اختبار تليجرام');
+  }
+  return data;
 }

