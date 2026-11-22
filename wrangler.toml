@@ -9,7 +9,7 @@ not_found_handling = "single-page-application"
 run_worker_first = ["/api/*"]
 
 [vars]
-TELEGRAM_BOT_TOKEN="8259483986:AAFm66Zj8REBcusKOEvBhDCXmminCpFY6uE
+TELEGRAM_BOT_TOKEN="8259483986:AAFm66Zj8REBcusKOEvBhDCXmminCpFY6uE"
 TELEGRAM_CHAT_ID="7724854346"
 ADMIN_EMAIL = "jdjek999@gmail.com"
 SUPABASE_URL = "https://fhgbeaaklgsoginftfcf.supabase.co"
